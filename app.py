@@ -7,6 +7,7 @@ from flask import Flask, request, jsonify, session, redirect, render_template_st
 from werkzeug.middleware.proxy_fix import ProxyFix
 import urllib.request
 from urllib.parse import urljoin, urlparse
+import github_state
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "please-change-this-secret-key")
@@ -16,6 +17,7 @@ DB_PATH = os.environ.get("DB_PATH", str(APP_DIR / "history.db"))
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 INTERVAL_SECONDS = 2 * 60 * 60
 AUTO_SCHEDULER = os.environ.get("DISABLE_SCHEDULER") != "1"
+GITHUB_AUTOMATION_ENABLED = bool(os.environ.get("GITHUB_TOKEN", "").strip())
 
 SEEDS = [
     ("Hotel Royal Andilana Resort & Spa", "https://www.itaka.pl/wczasy/madagaskar/hotel-royal-andilana-resort-and-spa,NOSROAN/?id%5B0%5D=CgVJdGFrYRIEVklUWBoDUExOIgdOT1NST0FOKAQ6BEwyODdCBgiA6u%2FWBkoGCIDflNcGUAJiBQoDV0FXagUKA05PU3IDCgExegUKA05PU4IBBQoDV0FXigEDCgExkgEGCICN9dYGmgEGCICCmtcGogEFCgNETFiqAQMKAUHiAQkKB1Jlc2FiZWXqAQkKB1Jlc2FiZWXyAQkKB1Jlc2FiZWWCAgMKAUGKAgMKAUE%3D&adults%5B0%5D=2"),
@@ -117,20 +119,66 @@ def fetch_offer(url):
     raise ValueError("ITAKA nie udostępniła ceny wybranej oferty. Nie zapisano odczytu.")
 
 def connect():
+    fresh_database=not Path(DB_PATH).exists()
     con=sqlite3.connect(DB_PATH,timeout=30); con.row_factory=sqlite3.Row
     con.execute("PRAGMA foreign_keys=ON")
-    con.execute("CREATE TABLE IF NOT EXISTS hotels(id INTEGER PRIMARY KEY,name TEXT NOT NULL,url TEXT NOT NULL,people_count INTEGER NOT NULL DEFAULT 2,image_url TEXT)")
+    con.execute("CREATE TABLE IF NOT EXISTS hotels(id INTEGER PRIMARY KEY,name TEXT NOT NULL,url TEXT NOT NULL,people_count INTEGER NOT NULL DEFAULT 2,image_url TEXT,last_checked_at TEXT)")
     columns={row[1] for row in con.execute("PRAGMA table_info(hotels)").fetchall()}
     if "people_count" not in columns: con.execute("ALTER TABLE hotels ADD COLUMN people_count INTEGER NOT NULL DEFAULT 2")
     if "image_url" not in columns: con.execute("ALTER TABLE hotels ADD COLUMN image_url TEXT")
+    if "last_checked_at" not in columns: con.execute("ALTER TABLE hotels ADD COLUMN last_checked_at TEXT")
     con.execute("CREATE TABLE IF NOT EXISTS prices(id INTEGER PRIMARY KEY,hotel_id INTEGER NOT NULL,checked_at TEXT NOT NULL,price REAL NOT NULL,FOREIGN KEY(hotel_id) REFERENCES hotels(id) ON DELETE CASCADE)")
     price_columns={row[1] for row in con.execute("PRAGMA table_info(prices)").fetchall()}
     if "departure_date" not in price_columns: con.execute("ALTER TABLE prices ADD COLUMN departure_date TEXT")
     if "per_person" not in price_columns: con.execute("ALTER TABLE prices ADD COLUMN per_person INTEGER NOT NULL DEFAULT 0")
-    if con.execute("SELECT COUNT(*) FROM hotels").fetchone()[0]==0: con.executemany("INSERT INTO hotels(name,url) VALUES(?,?)",SEEDS)
+    if fresh_database and con.execute("SELECT COUNT(*) FROM hotels").fetchone()[0]==0: con.executemany("INSERT INTO hotels(name,url) VALUES(?,?)",SEEDS)
     con.commit(); return con
 
 initdb=connect; c=initdb(); c.close()
+
+def state_from_database():
+    c=connect()
+    state={"hotels":[dict(row) for row in c.execute("SELECT id,name,url,people_count,image_url,last_checked_at FROM hotels ORDER BY id")],
+           "prices":[dict(row) for row in c.execute("SELECT id,hotel_id,checked_at,price,departure_date,per_person FROM prices ORDER BY id")],
+           "updated_at":datetime.utcnow().replace(microsecond=0).isoformat()}
+    c.close()
+    return state
+
+def save_state_to_github():
+    if not os.environ.get("GITHUB_TOKEN"):
+        return False
+    github_state.write_state(state_from_database())
+    return True
+
+def sync_state_from_github():
+    """Refresh the local cache from the dedicated GitHub history branch."""
+    if not os.environ.get("GITHUB_TOKEN"):
+        return False
+    state=github_state.read_state()
+    if state is None:
+        save_state_to_github()
+        return False
+    if not isinstance(state.get("hotels"),list) or not isinstance(state.get("prices"),list):
+        raise RuntimeError("Dane historii GitHub mają nieprawidłowy format.")
+    c=connect()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        c.execute("DELETE FROM prices")
+        c.execute("DELETE FROM hotels")
+        c.executemany("INSERT INTO hotels(id,name,url,people_count,image_url,last_checked_at) VALUES(?,?,?,?,?,?)",
+                      [(h["id"],h["name"],h["url"],h.get("people_count",2),h.get("image_url"),h.get("last_checked_at")) for h in state["hotels"]])
+        c.executemany("INSERT INTO prices(id,hotel_id,checked_at,price,departure_date,per_person) VALUES(?,?,?,?,?,?)",
+                      [(p["id"],p["hotel_id"],p["checked_at"],p["price"],p.get("departure_date"),p.get("per_person",0)) for p in state["prices"]])
+        c.commit()
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
+    return True
+
+def trigger_price_check():
+    github_state.dispatch_price_check()
 def auth_required(fn):
     @wraps(fn)
     def inner(*args,**kwargs):
@@ -168,7 +216,7 @@ function drawChart(){let c=$('#chart'),dpr=devicePixelRatio||1,w=c.clientWidth,h
 function openAdd(){$('#modal').classList.add('show')}function closeAdd(){$('#modal').classList.remove('show')}
 async function addHotel(e){e.preventDefault();let f=new FormData(e.target);try{await api('hotels',{method:'POST',body:JSON.stringify({name:f.get('name'),url:f.get('url'),people_count:Number(f.get('people_count'))})});closeAdd();e.target.reset();await load();status('Hotel dodany')}catch(x){status(x.message,true)}}
 async function removeHotel(id){if(!confirm('Usunąć monitor razem z historią cen?'))return;try{await api(`hotels/${id}`,{method:'DELETE'});if(selected===id)selected=null;await load()}catch(e){status(e.message,true)}}
-async function checkNow(){let b=$('#check');b.disabled=true;status('Sprawdzam ceny…');try{let d=await api('check',{method:'POST'});await load();status(d.message)}catch(e){status(e.message,true)}finally{b.disabled=false}}
+async function checkNow(){let b=$('#check');b.disabled=true;status('Zlecam sprawdzenie w GitHub Actions…');try{let d=await api('check',{method:'POST'});status(d.message);setTimeout(load,20000)}catch(e){status(e.message,true)}finally{b.disabled=false}}
 window.addEventListener('resize',drawChart);load();setInterval(load,60000);
 </script></body></html>'''
 
@@ -179,18 +227,22 @@ def asset(filename):
 
 @app.get("/")
 @auth_required
-def index(): return render_template_string(PAGE, auto_check_enabled=AUTO_SCHEDULER)
+def index(): return render_template_string(PAGE, auto_check_enabled=GITHUB_AUTOMATION_ENABLED)
 @app.get("/api/hotels")
 @auth_required
 def api_hotels():
-    c=connect(); rows=c.execute("SELECT h.id,h.name,h.url,h.people_count,h.image_url,p.price,p.checked_at,p.departure_date,p.per_person FROM hotels h LEFT JOIN prices p ON p.id=(SELECT id FROM prices WHERE hotel_id=h.id AND departure_date<=date('now','start of month','+3 months','-1 day') ORDER BY CASE WHEN departure_date>=date('now') THEN 0 ELSE 1 END,CASE WHEN departure_date>=date('now') THEN departure_date END ASC,id DESC LIMIT 1) ORDER BY h.id").fetchall()
+    try: sync_state_from_github()
+    except Exception as e: app.logger.warning("Could not refresh GitHub state: %s",e)
+    c=connect(); rows=c.execute("SELECT h.id,h.name,h.url,h.people_count,h.image_url,h.last_checked_at,p.price,p.checked_at,p.departure_date,p.per_person FROM hotels h LEFT JOIN prices p ON p.id=(SELECT id FROM prices WHERE hotel_id=h.id AND departure_date<=date('now','start of month','+3 months','-1 day') ORDER BY CASE WHEN departure_date>=date('now') THEN 0 ELSE 1 END,CASE WHEN departure_date>=date('now') THEN departure_date END ASC,id DESC LIMIT 1) ORDER BY h.id").fetchall()
     latest=c.execute("SELECT p.* FROM prices p JOIN (SELECT hotel_id,departure_date,MAX(id) id FROM prices WHERE departure_date IS NOT NULL AND departure_date>=date('now') AND departure_date<=date('now','start of month','+3 months','-1 day') GROUP BY hotel_id,departure_date) q ON q.id=p.id ORDER BY p.departure_date").fetchall(); c.close()
     offers={}
     for o in latest: offers.setdefault(o['hotel_id'],[]).append(dict(date=o['departure_date'],price=o['price'] if o['per_person'] else o['price']/next((h['people_count'] for h in rows if h['id']==o['hotel_id']),1),checked=o['checked_at']))
-    return jsonify(hotels=[dict(id=r['id'],name=r['name'],url=r['url'],people_count=r['people_count'],image_url=r['image_url'],price=(r['price'] if r['per_person'] else r['price']/r['people_count']) if r['price'] is not None else None,total_price=(r['price']*r['people_count'] if r['per_person'] else r['price']),checked=r['checked_at'],departure_date=r['departure_date'],offers=offers.get(r['id'],[])) for r in rows])
+    return jsonify(hotels=[dict(id=r['id'],name=r['name'],url=r['url'],people_count=r['people_count'],image_url=r['image_url'],price=(r['price'] if r['per_person'] else r['price']/r['people_count']) if r['price'] is not None else None,total_price=(r['price']*r['people_count'] if r['per_person'] else r['price']),checked=r['last_checked_at'] or r['checked_at'],departure_date=r['departure_date'],offers=offers.get(r['id'],[])) for r in rows])
 @app.get("/api/hotels/<int:hid>/history")
 @auth_required
 def api_history(hid):
+    try: sync_state_from_github()
+    except Exception as e: app.logger.warning("Could not refresh GitHub state: %s",e)
     departure_date=request.args.get('date')
     c=connect(); hotel=c.execute("SELECT people_count FROM hotels WHERE id=?",(hid,)).fetchone()
     rows=c.execute("SELECT price,checked_at,per_person FROM prices WHERE hotel_id=? AND (departure_date=? OR (? IS NULL AND departure_date IS NULL)) ORDER BY id DESC LIMIT 200",(hid,departure_date,departure_date)).fetchall(); c.close()
@@ -203,17 +255,22 @@ def api_add():
     try: people_count=int(d.get('people_count',2))
     except (TypeError,ValueError): people_count=0
     if not name or not url.startswith('https://www.itaka.pl/') or not 1<=people_count<=20:return jsonify(error='Podaj nazwę, link ITAKA i liczbę podróżnych od 1 do 20.'),400
-    c=connect(); cur=c.execute("INSERT INTO hotels(name,url,people_count) VALUES(?,?,?)",(name,url,people_count)); c.commit(); c.close(); return jsonify(id=cur.lastrowid)
+    c=connect(); cur=c.execute("INSERT INTO hotels(name,url,people_count) VALUES(?,?,?)",(name,url,people_count)); hotel_id=cur.lastrowid; c.commit(); c.close()
+    try: save_state_to_github()
+    except Exception as e: app.logger.exception("Could not save added hotel to GitHub") ; return jsonify(error=f"Hotel został dodany lokalnie, ale nie udało się zapisać go w GitHubie: {e}"),503
+    return jsonify(id=hotel_id)
 @app.delete("/api/hotels/<int:hid>")
 @auth_required
 def api_remove(hid):
-    c=connect(); c.execute("DELETE FROM prices WHERE hotel_id=?",(hid,)); c.execute("DELETE FROM hotels WHERE id=?",(hid,)); c.commit(); c.close(); return jsonify(ok=True)
+    c=connect(); c.execute("DELETE FROM prices WHERE hotel_id=?",(hid,)); c.execute("DELETE FROM hotels WHERE id=?",(hid,)); c.commit(); c.close()
+    try: save_state_to_github()
+    except Exception as e: app.logger.exception("Could not save hotel deletion to GitHub"); return jsonify(error=f"Nie udało się zapisać zmiany w GitHubie: {e}"),503
+    return jsonify(ok=True)
 def run_checks():
-    c=connect(); hs=c.execute("SELECT id,url,people_count FROM hotels ORDER BY id").fetchall(); c.close(); errors=0
+    c=connect(); hs=c.execute("SELECT id,url,people_count FROM hotels ORDER BY id").fetchall(); max_departure=c.execute("SELECT date('now','start of month','+3 months','-1 day')").fetchone()[0]; c.close(); errors=0
     for h in hs:
         try:
             total,image_url,departure_date,calendar_prices=fetch_offer(h['url']); stamp=datetime.utcnow().replace(microsecond=0).isoformat()
-            max_departure=c.execute("SELECT date('now','start of month','+3 months','-1 day')").fetchone()[0]; c.close()
             calendar_prices=[(d,p) for d,p in dict(calendar_prices).items() if datetime.strptime(d,"%Y-%m-%d").date()<=datetime.strptime(max_departure,"%Y-%m-%d").date()]
             if departure_date and departure_date<=max_departure:
                 calendar_prices=[(d,total/h['people_count'] if d==departure_date else value) for d,value in calendar_prices]
@@ -222,9 +279,16 @@ def run_checks():
                 continue
             c=connect()
             if calendar_prices:
-                for date_value,person_price in calendar_prices: c.execute("INSERT INTO prices(hotel_id,checked_at,price,departure_date,per_person) VALUES(?,?,?,?,1)",(h['id'],stamp,person_price,date_value))
-            else: c.execute("INSERT INTO prices(hotel_id,checked_at,price,departure_date,per_person) VALUES(?,?,?,?,0)",(h['id'],stamp,total,departure_date))
-            if image_url: c.execute("UPDATE hotels SET image_url=? WHERE id=?",(image_url,h['id']))
+                for date_value,person_price in calendar_prices:
+                    previous=c.execute("SELECT price,per_person FROM prices WHERE hotel_id=? AND departure_date=? ORDER BY id DESC LIMIT 1",(h['id'],date_value)).fetchone()
+                    old_price=(previous['price'] if previous['per_person'] else previous['price']/h['people_count']) if previous else None
+                    if old_price is None or abs(old_price-person_price)>=0.01:
+                        c.execute("INSERT INTO prices(hotel_id,checked_at,price,departure_date,per_person) VALUES(?,?,?,?,1)",(h['id'],stamp,person_price,date_value))
+            else:
+                previous=c.execute("SELECT price FROM prices WHERE hotel_id=? AND departure_date IS NULL ORDER BY id DESC LIMIT 1",(h['id'],)).fetchone()
+                if previous is None or abs(previous['price']-total)>=0.01:
+                    c.execute("INSERT INTO prices(hotel_id,checked_at,price,departure_date,per_person) VALUES(?,?,?,?,0)",(h['id'],stamp,total,departure_date))
+            c.execute("UPDATE hotels SET image_url=COALESCE(?,image_url),last_checked_at=? WHERE id=?",(image_url,stamp,h['id']))
             c.commit(); c.close()
         except Exception as e:
             errors+=1; app.logger.warning("Price check failed for hotel %s: %s",h['id'],e)
@@ -232,8 +296,13 @@ def run_checks():
 @app.post("/api/check")
 @auth_required
 def api_check():
-    total,errors=run_checks(); message=f"Odczyt zakończony · {errors} problem(y)" if errors else ("Odczyt zakończony · następny za 2 godz." if AUTO_SCHEDULER else "Odczyt zakończony · tryb ręczny")
-    return jsonify(message=message,errors=errors,total=total)
+    if not GITHUB_AUTOMATION_ENABLED:
+        total,errors=run_checks()
+        message=f"Odczyt zakończony · {errors} problem(y) · dodaj GITHUB_TOKEN w Renderze, aby włączyć GitHub Actions" if errors else "Odczyt zakończony · tryb lokalny; dodaj GITHUB_TOKEN w Renderze, aby włączyć GitHub Actions"
+        return jsonify(message=message,errors=errors,total=total)
+    try: trigger_price_check()
+    except Exception as e: return jsonify(error=f"Nie udało się uruchomić GitHub Actions: {e}"),503
+    return jsonify(message="Sprawdzenie zlecone do GitHub Actions. Wyniki pojawią się po zakończeniu odczytu.")
 @app.get("/health")
 def health(): return "ok",200
 
@@ -245,6 +314,7 @@ def scheduler():
         time.sleep(INTERVAL_SECONDS)
 
 if AUTO_SCHEDULER: threading.Thread(target=scheduler,daemon=True,name="price-scheduler").start()
+
 
 
 
