@@ -2,17 +2,15 @@ services:
   - type: web
     name: monitor-cen-hoteli
     runtime: python
-    plan: starter
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app --workers 1 --threads 4 --bind 0.0.0.0:$PORT
     healthCheckPath: /health
-    disk:
-      name: monitor-data
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
       - key: DB_PATH
-        value: /var/data/history.db
+        value: /tmp/history.db
+      - key: DISABLE_SCHEDULER
+        value: "1"
       - key: APP_PASSWORD
         sync: false
       - key: SECRET_KEY
