@@ -3,7 +3,7 @@ services:
     name: monitor-cen-hoteli
     runtime: python
     plan: free
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt && PLAYWRIGHT_BROWSERS_PATH=/opt/render/project/src/.pw-browsers python -m playwright install chromium --only-shell
     startCommand: gunicorn app:app --workers 1 --threads 4 --bind 0.0.0.0:$PORT
     healthCheckPath: /health
     envVars:
@@ -15,3 +15,5 @@ services:
         sync: false
       - key: SECRET_KEY
         generateValue: true
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: /opt/render/project/src/.pw-browsers

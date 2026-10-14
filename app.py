@@ -67,6 +67,32 @@ def extract_departure_date(text):
     month=PL_MONTHS.get(m.group(2).lower())
     return f"{m.group(3)}-{month}-{int(m.group(1)):02d}" if month else None
 
+def fetch_dynamic_calendar(url):
+    """Read ITAKA's client-rendered calendar, which includes later months."""
+    from playwright.sync_api import sync_playwright
+    collected=[]
+    with sync_playwright() as p:
+        browser=p.chromium.launch(headless=True,args=["--no-sandbox"])
+        try:
+            page=browser.new_page(locale="pl-PL",timezone_id="Europe/Warsaw")
+            page.goto(url,wait_until="domcontentloaded",timeout=60000)
+            when=page.get_by_role("button",name=re.compile(r"Kiedy:"))
+            when.wait_for(state="visible",timeout=30000)
+            when.click()
+            page.get_by_role("button",name="Go to the Next Month").wait_for(state="visible",timeout=10000)
+            def read_visible_months():
+                return page.locator("button[aria-label]").evaluate_all("buttons => buttons.map(b => { const p=[...b.querySelectorAll('div')].find(x => /price/i.test(x.className)); return {label:b.getAttribute('aria-label')||'',price:p?.textContent||''}; })")
+            collected.extend(read_visible_months())
+            page.get_by_role("button",name="Go to the Next Month").click()
+            collected.extend(read_visible_months())
+        finally:
+            browser.close()
+    result=[]
+    for item in collected:
+        found=parse_calendar_price(item.get("label",""),item.get("price",""))
+        if found: result.append(found)
+    return list(dict(result).items())
+
 def fetch_offer(url):
     req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36","Accept-Language":"pl-PL,pl;q=0.9"})
     with urllib.request.urlopen(req,timeout=35) as res: html=res.read().decode(res.headers.get_content_charset() or "utf-8",errors="replace")
@@ -82,6 +108,11 @@ def fetch_offer(url):
                 fee_match=re.search(r"\+\s*(\d+)\s*zł\s*\(TFG",text,re.I)
                 fee=int(fee_match.group(1)) if fee_match else 0
                 calendar_prices=[(d,price+fee) for d,price in p.calendar_prices]
+                try:
+                    dynamic_prices=fetch_dynamic_calendar(url)
+                    if dynamic_prices: calendar_prices=[(d,price+fee) for d,price in dynamic_prices]
+                except Exception as e:
+                    app.logger.warning("Dynamic ITAKA calendar unavailable; using page HTML: %s",e)
                 return val,image_url,departure_date,calendar_prices
     raise ValueError("ITAKA nie udostępniła ceny wybranej oferty. Nie zapisano odczytu.")
 
