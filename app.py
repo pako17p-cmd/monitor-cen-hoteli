@@ -375,7 +375,8 @@ def rainbow_airport_variants(url, departure_date=None, selected_code=None):
                 picker.wait_for(state="visible",timeout=20000)
                 picker.click(force=True,timeout=10000)
                 label=f"{target.day} {month_abbr[target.strftime('%m')]} {target.year}"
-                target_button=page.get_by_role("button",name=re.compile(rf"^0?{target.day}[ ]+{month_abbr[target.strftime('%m')]}[ ]+{target.year}$",re.I))
+                month_labels={"01":"(?:sty|stycznia)","02":"(?:lut|lutego)","03":"(?:mar|marca)","04":"(?:kwi|kwietnia)","05":"(?:maj|maja)","06":"(?:cze|czerwca)","07":"(?:lip|lipca)","08":"(?:sie|sierpnia)","09":"(?:wrz|września)","10":"(?:paź|paz|października)","11":"(?:lis|listopada)","12":"(?:gru|grudnia)"}
+                target_button=page.get_by_role("button",name=re.compile(rf"(?<![0-9])0?{target.day}[ ]+{month_labels[target.strftime('%m')]}[ ]+{target.year}",re.I))
                 for _ in range(12):
                     if target_button.count() and target_button.first.is_visible(): break
                     nxt=page.get_by_role("button",name="Następna",exact=True)
