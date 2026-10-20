@@ -249,6 +249,8 @@ def fetch_rainbow_offer(url, people_count=2):
             collect_visible_calendar_prices()
             calendar_prices=list(seen.items())
             if not calendar_prices:
+                samples=page.locator("button").evaluate_all("""buttons => buttons.filter(b => /20\\d{2}/.test((b.getAttribute('aria-label')||'')+' '+(b.getAttribute('title')||'')+' '+(b.innerText||b.textContent||''))).slice(0,20).map(b => ({label:b.getAttribute('aria-label')||b.getAttribute('title')||'', text:b.innerText||b.textContent||''}))""")
+                app.logger.warning("Rainbow calendar sample buttons: %s",samples)
                 raise ValueError("Rainbow nie udostępniło cen w kalendarzu wyjazdów.")
         finally:
             browser.close()
