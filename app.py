@@ -119,12 +119,12 @@ RAINBOW_MONTHS={"sty":"01","lut":"02","mar":"03","kwi":"04","maj":"05","cze":"06
 RAINBOW_MONTH_NAMES={"01":"styczeń","02":"luty","03":"marzec","04":"kwiecień","05":"maj","06":"czerwiec","07":"lipiec","08":"sierpień","09":"wrzesień","10":"październik","11":"listopad","12":"grudzień"}
 
 def parse_rainbow_calendar_price(label):
-    label=re.sub(r"\\s+"," ",(label or "")).replace("\\u00a0"," ").strip()
-    m=re.search(r"(?<!\\d)(\\d{1,2})\\s+(sty|lut|mar|kwi|maj|cze|lip|sie|wrz|paź|paz|lis|gru)\\s+(20\\d{2})(?:\\s*[,·-]\\s*([\\d\\s]+(?:[,.]\\d{2})?))?",label,re.I)
+    label=re.sub(r"\s+"," ",(label or "")).replace("\u00a0"," ").strip()
+    m=re.search(r"(?<!\d)(\d{1,2})\s+(sty|lut|mar|kwi|maj|cze|lip|sie|wrz|paź|paz|lis|gru)\s+(20\d{2})(?:\s*[,·-]\s*([\d\s]+(?:[,.]\d{2})?))?",label,re.I)
     if not m or not m.group(4):
         return None
     month=RAINBOW_MONTHS.get(m.group(2).lower())
-    raw=re.sub(r"\\s","",m.group(4)).replace(",",".")
+    raw=re.sub(r"\s","",m.group(4)).replace(",",".")
     try:
         price=float(raw)
         departure=datetime.strptime(f"{m.group(3)}-{month}-{int(m.group(1)):02d}","%Y-%m-%d").date().isoformat()
@@ -150,7 +150,7 @@ def fetch_rainbow_offer(url, people_count=2):
             page=browser.new_page(locale="pl-PL",timezone_id="Europe/Warsaw")
             page.goto(safe_url,wait_until="domcontentloaded",timeout=60000)
             try:
-                page.get_by_text(re.compile(r"Cena\\s+razem",re.I)).first.wait_for(state="visible",timeout=30000)
+                page.get_by_text(re.compile(r"Cena\s+razem",re.I)).first.wait_for(state="visible",timeout=30000)
             except Exception:
                 page.locator("body").wait_for(state="visible",timeout=10000)
             page_text=page.locator("body").inner_text(timeout=20000)
@@ -159,10 +159,10 @@ def fetch_rainbow_offer(url, people_count=2):
             if image.count():
                 image_url=image.first.get_attribute("content")
 
-            date_picker=page.get_by_role("button",name=re.compile(r"\\d{2}\\.\\d{2}\\.20\\d{2}\\s*[-–]\\s*\\d{2}\\.\\d{2}\\.20\\d{2}"))
+            date_picker=page.get_by_role("button",name=re.compile(r"\d{2}\.\d{2}\.20\d{2}\s*[-–]\s*\d{2}\.\d{2}\.20\d{2}"))
             date_picker.wait_for(state="visible",timeout=15000)
             date_picker.click()
-            day_button=page.get_by_role("button",name=re.compile(r"\\d{1,2}\\s+(?:sty|lut|mar|kwi|maj|cze|lip|sie|wrz|paź|paz|lis|gru)\\s+20\\d{2}",re.I))
+            day_button=page.get_by_role("button",name=re.compile(r"\d{1,2}\s+(?:sty|lut|mar|kwi|maj|cze|lip|sie|wrz|paź|paz|lis|gru)\s+20\d{2}",re.I))
             day_button.wait_for(state="visible",timeout=15000)
             target_month=rainbow_calendar_target()
             for _ in range(4):
@@ -187,20 +187,20 @@ def fetch_rainbow_offer(url, people_count=2):
                 raise ValueError("Rainbow nie udostępniło cen w kalendarzu wyjazdów.")
         finally:
             browser.close()
-    text=re.sub(r"\\s+"," ",page_text).replace("\\u00a0"," ")
-    total_match=re.search(r"Cena\\s+razem\\s*:?\\s*([\\d\\s.,]+)\\s*zł",text,re.I)
+    text=re.sub(r"\s+"," ",page_text).replace("\u00a0"," ")
+    total_match=re.search(r"Cena\s+razem\s*:?\s*([\d\s.,]+)\s*zł",text,re.I)
     if total_match:
-        raw=re.sub(r"\\s","",total_match.group(1)).replace(",",".")
+        raw=re.sub(r"\s","",total_match.group(1)).replace(",",".")
         total=float(raw)
     else:
-        per_person_match=re.search(r"([\\d\\s.,]+)\\s*zł\\s*/\\s*os\\.",text,re.I)
+        per_person_match=re.search(r"([\d\s.,]+)\s*zł\s*/\s*os\.",text,re.I)
         if not per_person_match:
             raise ValueError("Rainbow nie udostępniło teraz ceny wybranej oferty.")
-        raw=re.sub(r"\\s","",per_person_match.group(1)).replace(",",".")
+        raw=re.sub(r"\s","",per_person_match.group(1)).replace(",",".")
         total=round(float(raw)*max(1,int(people_count)),2)
     price_position=total_match.start() if total_match else per_person_match.start()
     nearby=text[max(0,price_position-1200):price_position]
-    date_matches=list(re.finditer(r"(?<!\\d)(\\d{2}\\.\\d{2}\\.20\\d{2})\\s*[-–]\\s*\\d{2}\\.\\d{2}\\.20\\d{2}",nearby))
+    date_matches=list(re.finditer(r"(?<!\d)(\d{2}\.\d{2}\.20\d{2})\s*[-–]\s*\d{2}\.\d{2}\.20\d{2}",nearby))
     if not date_matches:
         raise ValueError("Rainbow nie udostępniło daty wybranego wylotu.")
     departure_date=datetime.strptime(date_matches[-1].group(1),"%d.%m.%Y").date().isoformat()
