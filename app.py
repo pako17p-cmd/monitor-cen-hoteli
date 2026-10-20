@@ -196,7 +196,7 @@ def fetch_rainbow_offer(url, people_count=2):
             date_picker.wait_for(state="visible",timeout=15000)
             date_picker.click()
             day_button=page.get_by_role("button",name=re.compile(r"\d{1,2}\s+(?:sty|lut|mar|kwi|maj|cze|lip|sie|wrz|paź|paz|lis|gru)\s+20\d{2}",re.I))
-            day_button.wait_for(state="visible",timeout=15000)
+            day_button.first.wait_for(state="visible",timeout=15000)
             seen={}
             def collect_visible_calendar_prices():
                 buttons=page.locator("button").evaluate_all("""buttons => buttons.map(b => ({label:b.getAttribute('aria-label')||b.getAttribute('title')||'', text:b.innerText||b.textContent||''}))""")
