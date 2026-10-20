@@ -1,5 +1,5 @@
 import base64, json, os, re, sqlite3, threading, time
-from datetime import datetime
+from datetime import datetime, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
 from functools import wraps
@@ -666,6 +666,8 @@ def api_hotels():
     for h in rows:
         try: airport_options=json.loads(h['airport_options'] or "[]")
         except Exception: airport_options=[]
+        if isinstance(airport_options,dict):
+            airport_options=[dict(code=h['airport_code'],name=h['airport_name'] or "Lotnisko z oferty")]
         if is_itaka_url(h['url']) and {o.get('code') for o in airport_options}==set(AIRPORT_NAMES):
             # Ignore the legacy all-airports placeholder until ITAKA options are fetched for this offer.
             airport_options=[dict(code=h['airport_code'],name=h['airport_name'] or "Lotnisko z oferty")]
@@ -728,70 +730,159 @@ def api_add():
     try: save_state_to_github()
     except Exception as e: app.logger.exception("Could not save added hotel to GitHub") ; return jsonify(error=f"Hotel został dodany lokalnie, ale nie udało się zapisać go w GitHubie: {e}"),503
     return jsonify(id=hotel_id)
+def _decode_airport_options(raw):
+    try:
+        return json.loads(raw or "[]") if isinstance(raw, (str, bytes)) else (raw or [])
+    except Exception:
+        return []
+
+
+def refresh_airport_options():
+    """Discover airport variants on the GitHub Actions runner and persist them with the shared state."""
+    c=connect()
+    hotels=c.execute("SELECT id,url,airport_code,airport_name,airport_options FROM hotels ORDER BY id").fetchall()
+    horizon=c.execute("SELECT date('now','start of month','+3 months','-1 day')").fetchone()[0]
+    c.close()
+    now=datetime.utcnow().replace(microsecond=0)
+    cutoff=now-timedelta(hours=12)
+    checked=errors=0
+    for hotel in hotels:
+        cached=_decode_airport_options(hotel["airport_options"])
+        if is_rainbow_url(hotel["url"]):
+            by_date=cached.get("by_date",{}) if isinstance(cached,dict) else {}
+            c=connect()
+            dates=[row["departure_date"] for row in c.execute(
+                "SELECT DISTINCT p.departure_date FROM prices p LEFT JOIN tracked_departures_by_airport d ON d.hotel_id=p.hotel_id AND d.airport_code=p.airport_code AND d.departure_date=p.departure_date WHERE p.hotel_id=? AND p.airport_code=? AND p.departure_date>=date('now') AND p.departure_date<=? AND COALESCE(d.status,'available')='available' ORDER BY p.departure_date",
+                (hotel["id"],hotel["airport_code"],horizon)
+            )]
+            c.close()
+            for departure_date in dates:
+                entry=by_date.get(departure_date,{})
+                updated=entry.get("updated_at","") if isinstance(entry,dict) else ""
+                try: fresh=datetime.fromisoformat(updated)>cutoff
+                except (TypeError,ValueError): fresh=False
+                if fresh and entry.get("airports") and all(item.get("url") for item in entry["airports"]):
+                    continue
+                try:
+                    found=rainbow_airport_variants(hotel["url"],departure_date)["airports"]
+                    options=[]
+                    for candidate in found:
+                        selected=rainbow_airport_variants(hotel["url"],departure_date,candidate["code"])
+                        variant_url=sanitize_rainbow_url(selected["url"])
+                        if not is_rainbow_url(variant_url):
+                            raise ValueError("Rainbow nie zwróciło poprawnego linku wybranego lotu.")
+                        options.append(dict(code=candidate["code"],name=candidate["name"],url=variant_url))
+                    current_code=hotel["airport_code"]
+                    if current_code and current_code!="DEFAULT" and not any(item["code"]==current_code for item in options):
+                        options.insert(0,dict(code=current_code,name=hotel["airport_name"] or "Lotnisko z oferty",url=sanitize_rainbow_url(hotel["url"])))
+                    if not options:
+                        raise ValueError("Nie znaleziono lotnisk dla tego terminu.")
+                    by_date[departure_date]=dict(updated_at=now.isoformat(),airports=options)
+                    checked+=1
+                except Exception as exc:
+                    errors+=1
+                    app.logger.warning("Could not refresh Rainbow airports for hotel %s and %s: %s",hotel["id"],departure_date,exc)
+            payload=dict(version=1,by_date=by_date)
+            c=connect()
+            c.execute("UPDATE hotels SET airport_options=? WHERE id=?",(json.dumps(payload,ensure_ascii=False),hotel["id"]))
+            c.commit(); c.close()
+        elif is_itaka_url(hotel["url"]):
+            updated=cached.get("updated_at","") if isinstance(cached,dict) else ""
+            try: fresh=datetime.fromisoformat(updated)>cutoff
+            except (TypeError,ValueError): fresh=False
+            if fresh and cached.get("airports"):
+                continue
+            try:
+                options=itaka_airport_options(hotel["url"])
+                payload=dict(version=1,updated_at=now.isoformat(),airports=options)
+                c=connect()
+                c.execute("UPDATE hotels SET airport_options=? WHERE id=?",(json.dumps(payload,ensure_ascii=False),hotel["id"]))
+                c.commit(); c.close()
+                checked+=1
+            except Exception as exc:
+                errors+=1
+                app.logger.warning("Could not refresh ITAKA airports for hotel %s: %s",hotel["id"],exc)
+    return checked,errors
+
+
 @app.get("/api/hotels/<int:hid>/airports")
 @auth_required
 def api_airports(hid):
-    c=connect(); hotel=c.execute("SELECT url,airport_code,airport_name,airport_options FROM hotels WHERE id=?",(hid,)).fetchone(); c.close()
+    try: sync_state_from_github()
+    except Exception as exc: app.logger.warning("Could not refresh GitHub state before airport lookup: %s",exc)
+    c=connect()
+    hotel=c.execute("SELECT url,airport_code,airport_name,airport_options FROM hotels WHERE id=?",(hid,)).fetchone()
+    c.close()
     if not hotel: return jsonify(error="Nie znaleziono hotelu."),404
     departure_date=request.args.get("date")
-    if is_rainbow_url(hotel["url"]) and not departure_date:
-        return jsonify(airports=[dict(code=hotel["airport_code"],name=hotel["airport_name"] or "Lotnisko z oferty")])
-    try:
-        if is_rainbow_url(hotel["url"]):
-            result=rainbow_airport_variants(hotel["url"],departure_date)
-            airports=result["airports"]
-        else:
-            airports=itaka_airport_options(hotel["url"])
-        if hotel["airport_code"] and hotel["airport_code"]!="DEFAULT" and not any(a["code"]==hotel["airport_code"] for a in airports):
-            airports.insert(0,dict(code=hotel["airport_code"],name=hotel["airport_name"] or "Obecne lotnisko"))
-        c=connect(); c.execute("UPDATE hotels SET airport_options=? WHERE id=?",(json.dumps(airports,ensure_ascii=False),hid)); c.commit(); c.close()
-        warning="Nie znaleziono innych lotnisk dla tego terminu." if len(airports)<=1 else None
-        return jsonify(airports=airports,warning=warning)
-    except Exception as e:
-        app.logger.warning("Could not inspect airports for hotel %s and %s: %s",hid,departure_date,e)
-        try: cached=json.loads(hotel["airport_options"] or "[]")
-        except Exception: cached=[]
-        if is_itaka_url(hotel["url"]) and {o.get("code") for o in cached}==set(AIRPORT_NAMES): cached=[]
-        airports=cached if len(cached)>1 else [dict(code=hotel["airport_code"],name=hotel["airport_name"] or "Lotnisko z oferty")]
-        return jsonify(airports=airports,warning="Nie udało się odświeżyć lotnisk; pokazuję ostatnio zapisane dostępne dane." if len(airports)>1 else "Nie udało się pobrać listy lotnisk dla tego terminu.")
+    cached=_decode_airport_options(hotel["airport_options"])
+    if is_rainbow_url(hotel["url"]):
+        by_date=cached.get("by_date",{}) if isinstance(cached,dict) else {}
+        entry=by_date.get(departure_date,{}) if departure_date else {}
+        airports=entry.get("airports",[]) if isinstance(entry,dict) else []
+        airports=[dict(code=item.get("code"),name=item.get("name")) for item in airports if item.get("code")]
+        warning=None if airports else "GitHub Actions nie zapisał jeszcze lotnisk dla tego terminu. Spróbuj ponownie po zakończeniu sprawdzania."
+    else:
+        airports=cached.get("airports",[]) if isinstance(cached,dict) else cached
+        airports=[dict(code=item.get("code"),name=item.get("name")) for item in airports if item.get("code")]
+        warning=None if airports else "GitHub Actions nie zapisał jeszcze listy dostępnych lotnisk."
+    current_code=hotel["airport_code"]
+    if current_code and current_code!="DEFAULT" and not any(item["code"]==current_code for item in airports):
+        airports.insert(0,dict(code=current_code,name=hotel["airport_name"] or "Obecne lotnisko"))
+    if not airports:
+        airports=[dict(code=current_code,name=hotel["airport_name"] or "Lotnisko z oferty")]
+    if len(airports)<=1 and warning is None:
+        warning="Dla tego terminu nie znaleziono innych dostępnych lotnisk."
+    return jsonify(airports=airports,warning=warning)
+
 
 @app.post("/api/hotels/<int:hid>/airport")
 @auth_required
 def api_set_airport(hid):
+    try: sync_state_from_github()
+    except Exception as exc: app.logger.warning("Could not refresh GitHub state before airport selection: %s",exc)
     data=request.get_json(force=True); code=str(data.get("airport_code","")).upper()
-    c=connect(); hotel=c.execute("SELECT url FROM hotels WHERE id=?",(hid,)).fetchone()
-    if not hotel: c.close(); return jsonify(error="Nie znaleziono hotelu."),404
     departure_date=data.get("date")
+    c=connect()
+    hotel=c.execute("SELECT url,airport_options FROM hotels WHERE id=?",(hid,)).fetchone()
+    if not hotel: c.close(); return jsonify(error="Nie znaleziono hotelu."),404
+    cached=_decode_airport_options(hotel["airport_options"])
     if is_rainbow_url(hotel["url"]):
-        c.close()
-        if not re.fullmatch(r"R-[A-Z0-9-]+",code): return jsonify(error="Nieznany wariant lotu Rainbow."),400
-        if not departure_date: return jsonify(error="Wybierz termin wylotu przed zmianą lotniska."),400
-        try:
-            selected=rainbow_airport_variants(hotel["url"],departure_date,code)
-            airport=next((item for item in selected["airports"] if item["code"]==code),None)
-            if not airport: return jsonify(error="Rainbow nie udostępniło tego lotniska dla wybranego terminu."),400
-            new_url=selected["url"]; airport_name=airport["name"]; options=selected["airports"]
-        except Exception as e: return jsonify(error=f"Nie udało się zmienić lotniska Rainbow: {e}"),503
-        c=connect()
+        if not departure_date: c.close(); return jsonify(error="Wybierz termin wylotu przed zmianą lotniska."),400
+        by_date=cached.get("by_date",{}) if isinstance(cached,dict) else {}
+        entry=by_date.get(departure_date,{})
+        option=next((item for item in entry.get("airports",[]) if item.get("code")==code),None) if isinstance(entry,dict) else None
+        if not option or not option.get("url"):
+            c.close(); return jsonify(error="Brak zapisanej opcji tego lotniska. Poczekaj na GitHub Actions i odśwież listę."),409
+        new_url=sanitize_rainbow_url(option["url"])
+        if not is_rainbow_url(new_url):
+            c.close(); return jsonify(error="Nieprawidłowy zapisany link Rainbow."),400
+        airport_name=option["name"]
+        options=cached
     else:
-        if code not in AIRPORT_NAMES: c.close(); return jsonify(error="Nieznane lotnisko ITAKA."),400
+        available=cached.get("airports",[]) if isinstance(cached,dict) else cached
+        option=next((item for item in available if item.get("code")==code),None) if isinstance(available,list) else None
+        if not option or code not in AIRPORT_NAMES:
+            c.close(); return jsonify(error="To lotnisko nie jest zapisane jako dostępne dla tej oferty."),400
         query=parse_qsl(urlparse(hotel["url"]).query,keep_blank_values=True)
         query=[(key,value) for key,value in query if key!="airports"]
         query.append(("airports",code))
         parsed=urlparse(hotel["url"]); new_url=urlunparse(parsed._replace(query=urlencode(query,doseq=True)))
-        airport_name=AIRPORT_NAMES[code]
-        try: options=json.loads(c.execute("SELECT airport_options FROM hotels WHERE id=?",(hid,)).fetchone()["airport_options"] or "[]")
-        except Exception: options=[]
-        if not any(item.get("code")==code for item in options): options.insert(0,dict(code=code,name=airport_name))
-    c.execute("UPDATE hotels SET url=?,airport_code=?,airport_name=?,airport_options=? WHERE id=?",(new_url,code,airport_name,json.dumps(options,ensure_ascii=False),hid)); c.commit(); c.close()
+        airport_name=option.get("name") or AIRPORT_NAMES[code]
+        options=cached
+    c.execute("UPDATE hotels SET url=?,airport_code=?,airport_name=?,airport_options=? WHERE id=?",
+              (new_url,code,airport_name,json.dumps(options,ensure_ascii=False),hid))
+    c.commit(); c.close()
+    if not GITHUB_AUTOMATION_ENABLED:
+        return jsonify(error="Brak GITHUB_TOKEN. Odczyt i wybór lotniska są obsługiwane przez GitHub Actions."),503
     try:
         save_state_to_github()
-        if GITHUB_AUTOMATION_ENABLED: trigger_price_check()
-        else: run_checks()
-    except Exception as e:
-        app.logger.warning("Could not persist/check selected airport: %s",e)
-        return jsonify(error=f"Zapisano lotnisko, ale nie udało się zlecić odczytu: {e}"),503
-    return jsonify(ok=True,message="Zmieniono lotnisko. Trwa pobieranie aktualnej ceny.")
+        trigger_price_check()
+    except Exception as exc:
+        app.logger.warning("Could not persist/check selected airport: %s",exc)
+        return jsonify(error=f"Zapisano wybór lotniska, ale nie udało się zlecić odczytu GitHub Actions: {exc}"),503
+    return jsonify(ok=True,message="Lotnisko zmienione. GitHub Actions pobiera teraz ceny.")
+
 
 @app.delete("/api/hotels/<int:hid>")
 @auth_required
@@ -846,9 +937,7 @@ def run_checks():
 @auth_required
 def api_check():
     if not GITHUB_AUTOMATION_ENABLED:
-        total,errors=run_checks()
-        message=f"Odczyt zakończony · {errors} problem(y) · dodaj GITHUB_TOKEN w Renderze, aby włączyć GitHub Actions" if errors else "Odczyt zakończony · tryb lokalny; dodaj GITHUB_TOKEN w Renderze, aby włączyć GitHub Actions"
-        return jsonify(message=message,errors=errors,total=total)
+        return jsonify(error="Brak GITHUB_TOKEN. Sprawdzanie cen działa wyłącznie przez GitHub Actions."),503
     try: trigger_price_check()
     except Exception as e: return jsonify(error=f"Nie udało się uruchomić GitHub Actions: {e}"),503
     return jsonify(message="Sprawdzenie zlecone do GitHub Actions. Wyniki pojawią się po zakończeniu odczytu.")
