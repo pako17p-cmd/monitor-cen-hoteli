@@ -118,15 +118,37 @@ def is_supported_offer_url(url):
 RAINBOW_MONTHS={"sty":"01","lut":"02","mar":"03","kwi":"04","maj":"05","cze":"06","lip":"07","sie":"08","wrz":"09","paź":"10","paz":"10","lis":"11","gru":"12"}
 RAINBOW_MONTH_NAMES={"01":"styczeń","02":"luty","03":"marzec","04":"kwiecień","05":"maj","06":"czerwiec","07":"lipiec","08":"sierpień","09":"wrzesień","10":"październik","11":"listopad","12":"grudzień"}
 
-def parse_rainbow_calendar_price(label):
+def parse_rainbow_calendar_price(label, visible_text=""):
     label=re.sub(r"\s+"," ",(label or "")).replace("\u00a0"," ").strip()
-    m=re.search(r"(?<!\d)(\d{1,2})\s+(sty|lut|mar|kwi|maj|cze|lip|sie|wrz|paź|paz|lis|gru)\s+(20\d{2})(?:\s*[,·-]\s*([\d\s]+(?:[,.]\d{2})?))?",label,re.I)
-    if not m or not m.group(4):
+    visible_text=re.sub(r"\s+"," ",(visible_text or "")).replace("\u00a0"," ").strip()
+    date_pattern=r"(?<!\d)(\d{1,2})\s+(sty|lut|mar|kwi|maj|cze|lip|sie|wrz|paź|paz|lis|gru)\s+(20\d{2})"
+    m=re.search(date_pattern,label,re.I) or re.search(date_pattern,visible_text,re.I)
+    if not m:
         return None
     month=RAINBOW_MONTHS.get(m.group(2).lower())
-    raw=re.sub(r"\s","",m.group(4)).replace(",",".")
+    raw=None
+    suffix=label[m.end():]
+    direct=re.match(r"\s*[,·-]\s*([\d\s]+(?:[,.]\d{2})?)",suffix)
+    if direct:
+        raw=direct.group(1)
+    else:
+        # Rainbow exposes the accessible date label separately from the day and price text.
+        # The visible text often starts with the day number again, so try removing it first.
+        day_prefix=re.sub(rf"^\s*{int(m.group(1))}\s+", "", visible_text, count=1)
+        for candidate in (day_prefix,visible_text):
+            price_match=re.search(r"(?<!\d)(\d[\d\s]*(?:[,.]\d{2})?)",candidate)
+            if price_match:
+                digits=re.sub(r"\D","",price_match.group(1))
+                if len(digits)>=4:
+                    raw=price_match.group(1)
+                    break
+    if raw is None:
+        return None
+    digits=re.sub(r"\D","",raw)
+    if len(digits)<4:
+        return None
     try:
-        price=float(raw)
+        price=float(re.sub(r"\s","",raw).replace(",","."))
         departure=datetime.strptime(f"{m.group(3)}-{month}-{int(m.group(1)):02d}","%Y-%m-%d").date().isoformat()
     except (TypeError,ValueError):
         return None
@@ -201,8 +223,7 @@ def fetch_rainbow_offer(url, people_count=2):
             def collect_visible_calendar_prices():
                 buttons=page.locator("button").evaluate_all("""buttons => buttons.map(b => ({label:b.getAttribute('aria-label')||b.getAttribute('title')||'', text:b.innerText||b.textContent||''}))""")
                 for button in buttons:
-                    label=" ".join((button.get("label",""),button.get("text",""))).strip()
-                    found=parse_rainbow_calendar_price(label)
+                    found=parse_rainbow_calendar_price(button.get("label",""),button.get("text",""))
                     if found:
                         seen[found[0]]=found[1]
             collect_visible_calendar_prices()
