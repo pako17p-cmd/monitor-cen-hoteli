@@ -156,13 +156,19 @@ def fetch_rainbow_offer(url, people_count=2):
 
             # Rainbow blocks the offer calendar with a consent dialog on a fresh browser.
             # Keep optional cookies disabled: open settings and save the required-only defaults.
-            cookie_settings=page.get_by_role("button",name=re.compile(r"USTAWIENIA PLIKÓW COOKIE",re.I))
-            if cookie_settings.count() and cookie_settings.first.is_visible():
-                cookie_settings.first.click(timeout=10000)
-                save_settings=page.get_by_role("button",name=re.compile(r"ZAPISZ I WYJDŹ",re.I))
-                save_settings.wait_for(state="visible",timeout=10000)
-                save_settings.click(timeout=10000)
-                page.locator(".r-consent-bottom-notif__modal").wait_for(state="hidden",timeout=15000)
+            consent_overlay=page.locator(".r-consent-bottom-notif__modal:visible")
+            for _ in range(3):
+                if not consent_overlay.count():
+                    break
+                save_settings=page.get_by_role("button",name=re.compile(r"ZAPISZ I WYJDŹ",re.I)).last
+                if save_settings.count() and save_settings.is_visible():
+                    save_settings.click(timeout=10000)
+                else:
+                    cookie_settings=page.get_by_role("button",name=re.compile(r"USTAWIENIA PLIKÓW COOKIE",re.I)).last
+                    if not cookie_settings.count() or not cookie_settings.is_visible():
+                        raise ValueError("Rainbow wyświetliło okno cookies, którego nie udało się zamknąć.")
+                    cookie_settings.click(timeout=10000)
+            consent_overlay.wait_for(state="hidden",timeout=15000)
 
             # Wait until the offer configurator has finished loading before clicking its controls.
             page.locator('[id-dti="loader"]').wait_for(state="hidden",timeout=30000)
