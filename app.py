@@ -602,6 +602,9 @@ def api_hotels():
     for h in rows:
         try: airport_options=json.loads(h['airport_options'] or "[]")
         except Exception: airport_options=[]
+        if is_itaka_url(h['url']) and {o.get('code') for o in airport_options}==set(AIRPORT_NAMES):
+            # Ignore the legacy all-airports placeholder until ITAKA options are fetched for this offer.
+            airport_options=[dict(code=h['airport_code'],name=h['airport_name'] or "Lotnisko z oferty")]
         if not airport_options:
             airport_options=[dict(code=h['airport_code'],name=h['airport_name'] or "Lotnisko z oferty")]
         hotel_offers=offers.get((h['id'],h['airport_code']),[])
