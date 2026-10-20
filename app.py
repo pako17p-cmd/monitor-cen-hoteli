@@ -578,7 +578,8 @@ function openAdd(){$('#modal').classList.add('show')}function closeAdd(){$('#mod
 async function addHotel(e){e.preventDefault();let f=new FormData(e.target);try{await api('hotels',{method:'POST',body:JSON.stringify({name:f.get('name'),url:f.get('url'),people_count:Number(f.get('people_count'))})});closeAdd();e.target.reset();await load();status('Hotel dodany')}catch(x){status(x.message,true)}}
 async function removeHotel(id){if(!confirm('Usunąć monitor razem z historią cen?'))return;try{await api(`hotels/${id}`,{method:'DELETE'});if(selected===id)selected=null;await load()}catch(e){status(e.message,true)}}
 async function checkNow(){let b=$('#check');b.disabled=true;status('Zlecam sprawdzenie w GitHub Actions…');try{let d=await api('check',{method:'POST'});status(d.message);setTimeout(load,20000)}catch(e){status(e.message,true)}finally{b.disabled=false}}
-window.addEventListener('resize',drawChart);load().then(()=>{if(selected)loadAirportOptions(selected,selectedDate)});setInterval(load,60000);
+async function loadAllAirportOptions(){for(const h of hotels){const date=h.provider==='rainbow'?(h.offers?.find(o=>o.status==='available')?.date||h.departure_date):null;await loadAirportOptions(h.id,date)}}
+window.addEventListener('resize',drawChart);load().then(loadAllAirportOptions);setInterval(load,60000);
 </script></body></html>'''
 
 @app.get("/assets/<path:filename>")
