@@ -277,7 +277,7 @@ def fetch_rainbow_offer(url, people_count=2):
     departure_date=datetime.strptime(date_matches[-1].group(1),"%d.%m.%Y").date().isoformat()
     image_url=urljoin(url,image_url) if image_url else None
     if image_url and urlparse(image_url).scheme!="https": image_url=None
-    airport_match=re.search(r"(Warszawa(?:\s+Chopin)?|Poznań|Katowice|Wrocław|Gdańsk|Kraków|Rzeszów|Łódź|Szczecin|Bydgoszcz)\s+wylot\s+\d{1,2}:\d{2}",text,re.I)
+    airport_match=re.search(r"(Warszawa(?:\s*(?:-|–)?\s*(?:Chopin|Modlin))?|Poznań|Katowice|Wrocław|Gdańsk|Kraków|Rzeszów|Łódź|Szczecin|Bydgoszcz)\s+wylot\s+\d{1,2}:\d{2}",text,re.I)
     airport_name=airport_match.group(1).strip() if airport_match else "Lotnisko z oferty"
     airport_name=re.sub(r"\s+"," ",airport_name)
     airport_code="R-"+re.sub(r"[^A-Z0-9]+","-",airport_name.upper().replace("Ł","L").replace("Ó","O").replace("Ą","A").replace("Ę","E").replace("Ś","S").replace("Ć","C").replace("Ń","N").replace("Ż","Z").replace("Ź","Z")).strip("-")
@@ -297,7 +297,8 @@ def itaka_airport_options(url):
         browser=p.chromium.launch(headless=True,args=["--no-sandbox"])
         try:
             page=browser.new_page(locale="pl-PL",timezone_id="Europe/Warsaw")
-            page.goto(url,wait_until="domcontentloaded",timeout=60000)
+            # Don't wait for ITAKA analytics and tracking requests to finish.
+            page.goto(url,wait_until="commit",timeout=20000)
             page.locator("body").wait_for(state="visible",timeout=15000)
             page.wait_for_timeout(1200)
             control=page.get_by_text(re.compile(r"Skąd i jak",re.I)).first
@@ -431,7 +432,7 @@ def country_from_url(url):
     path=urlparse(url).path.lower()
     if "wyspy-kanaryjskie" in path or "teneryfa" in path: return "Hiszpania"
     parts=[p for p in path.split("/") if p]
-    known={"madagaskar":"Madagaskar","grecja":"Grecja","hiszpania":"Hiszpania","turcja":"Turcja","egipt":"Egipt","włochy":"Włochy","wlochy":"Włochy","portugalia":"Portugalia","cypr":"Cypr","tunezja":"Tunezja","maroko":"Maroko","chorwacja":"Chorwacja","dominikana":"Dominikana","meksyk":"Meksyk","kenia":"Kenia","wyspy-zielonego-przyladka":"Republika Zielonego Przylądka"}
+    known={"madagaskar":"Madagaskar","grecja":"Grecja","hiszpania":"Hiszpania","turcja":"Turcja","egipt":"Egipt","włochy":"Włochy","wlochy":"Włochy","portugalia":"Portugalia","cypr":"Cypr","tunezja":"Tunezja","maroko":"Maroko","chorwacja":"Chorwacja","dominikana":"Dominikana","meksyk":"Meksyk","kenia":"Kenia","malediwy":"Malediwy","maldives":"Malediwy","wyspy-zielonego-przyladka":"Republika Zielonego Przylądka"}
     for part in parts:
         if part in known: return known[part]
     return "Kraj nieustalony"
@@ -457,6 +458,13 @@ def connect():
     if "airport_name" not in columns: con.execute("ALTER TABLE hotels ADD COLUMN airport_name TEXT")
     if "airport_options" not in columns: con.execute("ALTER TABLE hotels ADD COLUMN airport_options TEXT NOT NULL DEFAULT '[]'")
     con.execute("UPDATE hotels SET country=COALESCE(country,'Kraj nieustalony'),airport_name=COALESCE(airport_name,'Lotnisko z oferty')")
+    for row in con.execute("SELECT id,url,country,airport_code,airport_name FROM hotels").fetchall():
+        inferred_country=country_from_url(row["url"])
+        inferred_airport=AIRPORT_NAMES.get(row["airport_code"])
+        if inferred_country!="Kraj nieustalony" and row["country"] in (None,"","Kraj nieustalony"):
+            con.execute("UPDATE hotels SET country=? WHERE id=?",(inferred_country,row["id"]))
+        if inferred_airport and row["airport_name"] in (None,"","Lotnisko z oferty"):
+            con.execute("UPDATE hotels SET airport_name=? WHERE id=?",(inferred_airport,row["id"]))
     con.execute("CREATE TABLE IF NOT EXISTS prices(id INTEGER PRIMARY KEY,hotel_id INTEGER NOT NULL,checked_at TEXT NOT NULL,price REAL NOT NULL,FOREIGN KEY(hotel_id) REFERENCES hotels(id) ON DELETE CASCADE)")
     price_columns={row[1] for row in con.execute("PRAGMA table_info(prices)").fetchall()}
     if "departure_date" not in price_columns: con.execute("ALTER TABLE prices ADD COLUMN departure_date TEXT")
@@ -560,7 +568,8 @@ async function load(){try{let d=await api('hotels');hotels=d.hotels;if(!selected
 function status(t,bad=false){$('#status').textContent=t;$('#status').style.color=bad?'#b42318':''}
 function drawHotels(){let root=$('#hotels');if(!hotels.length){root.innerHTML='<div class="empty">Dodaj hotel, aby rozpocząć monitorowanie.</div>';return}root.innerHTML=hotels.map(h=>{let chosenDate=selected===h.id&&selectedDate?h.offers.find(o=>o.date===selectedDate):null;let shownDate=chosenDate?.date||h.departure_date;let shownPrice=chosenDate?.price??h.price;let shownTotal=shownPrice===null?null:shownPrice*h.people_count;let active=h.offers.filter(o=>o.status==='available');let cheapest=active.length?Math.min(...active.map(o=>o.price)):null;return `<article class="hotel" onclick="selectHotel(${h.id})">${h.image_url?`<img class="thumb" src="${esc(h.image_url)}" alt="" loading="lazy" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'thumb missing',textContent:'🏝️'}))">`:`<div class="thumb missing">🏝️</div>`}<div><div class="hotelname">${esc(h.name)}</div><div class="meta">${esc(h.country||'Kraj nieustalony')} · ${h.people_count} os. · Wylot: ${dateOnly(shownDate)} · ${h.checked?`Ostatni odczyt: ${date(h.checked)}`:'Oczekuje na pierwszy odczyt'}</div><div class="meta airport-label">Lotnisko: ${esc(h.airport_name||'Lotnisko z oferty')}</div>${h.airport_options?.length>1?`<select class="airport-select" onclick="event.stopPropagation()" onchange="changeAirport(${h.id},this.value)"><option value="">Zmień lotnisko…</option>${h.airport_options.map(o=>`<option value="${esc(o.code)}" ${o.code===h.airport_code?'selected':''}>${esc(o.name)}</option>`).join('')}</select>`:''}</div><div class="pricebox"><div class="price">${shownPrice===null?'—':money(shownPrice)} / os.</div>${shownTotal===null?'':`<div class="meta">Łącznie: ${money(shownTotal)}</div>`}</div><div class="rowbuttons"><button class="history-btn small" onclick="event.stopPropagation();selectHotel(${h.id},'${shownDate||''}')">Historia</button><button class="offer-btn small" onclick="event.stopPropagation();window.open('${esc(h.url)}','_blank')">Otwórz ofertę</button><button class="delete-btn small" onclick="event.stopPropagation();removeHotel(${h.id})">Usuń</button><button class="terms-btn small" onclick="event.stopPropagation();toggleDates(${h.id})">Terminy i ceny (${h.offers.length})</button></div><div class="departures ${expandedHotels.has(h.id)?'show':''}">${h.offers.length?h.offers.map(o=>{let inactive=o.status!=='available';return `<button class="departure-choice ${inactive?'inactive ':''}${selected===h.id&&selectedDate===o.date?'active':''}" onclick="event.stopPropagation();selectHotel(${h.id},'${o.date}')"><span>${inactive?`<s>Wylot ${dateOnly(o.date)} · ${money(o.price)} / os.</s>`:`Wylot ${dateOnly(o.date)} · ${money(o.price)} / os.`}</span>${o.status==='expired'?'<span class="term-status">Termin minął</span>':o.status==='unavailable'?'<span class="term-status">Oferta niedostępna</span>':''}${!inactive&&o.price===cheapest?'<span class="best-badge">Najtaniej</span>':''}</button>`}).join(''):'<span class="meta">Kalendarz terminów będzie dostępny po odczycie ITAKA.</span>'}</div></article>`}).join('')}
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-async function selectHotel(id,departure){selected=id;selectedDate=departure||hotels.find(h=>h.id===id)?.offers?.[0]?.date||null;drawHotels();await loadHistory();let h=hotels.find(x=>x.id===id);if(h?.provider==='rainbow'&&selectedDate||h?.provider==='itaka'){try{let url=`hotels/${id}/airports`;if(selectedDate)url+=`?date=${encodeURIComponent(selectedDate)}`;let d=await api(url);h.airport_options=d.airports||[];if(h.airport_code&&h.airport_code!=='DEFAULT'&&!h.airport_options.some(o=>o.code===h.airport_code))h.airport_options.unshift({code:h.airport_code,name:h.airport_name||'Obecne lotnisko'});drawHotels();if(d.warning)status(d.warning,true)}catch(e){status(e.message,true)}}}
+async function loadAirportOptions(id,departure){let h=hotels.find(x=>x.id===id);if(!h||h.provider==='rainbow'&&!departure)return;try{let url=`hotels/${id}/airports`;if(departure)url+=`?date=${encodeURIComponent(departure)}`;let d=await api(url);h.airport_options=d.airports||[];if(h.airport_code&&h.airport_code!=='DEFAULT'&&!h.airport_options.some(o=>o.code===h.airport_code))h.airport_options.unshift({code:h.airport_code,name:h.airport_name||'Obecne lotnisko'});drawHotels();if(d.warning)status(d.warning,true)}catch(e){status(e.message,true)}}
+async function selectHotel(id,departure){selected=id;selectedDate=departure||hotels.find(h=>h.id===id)?.offers?.[0]?.date||null;drawHotels();await loadHistory();await loadAirportOptions(id,selectedDate)}
 async function changeAirport(id,code){if(!code)return;try{let result=await api(`hotels/${id}/airport`,{method:'POST',body:JSON.stringify({airport_code:code,date:selectedDate})});status(result.message||'Zmieniono lotnisko');await load();if(selected===id)await loadHistory()}catch(e){status(e.message,true);await load()}}
 function toggleDates(id){expandedHotels.has(id)?expandedHotels.delete(id):expandedHotels.add(id);drawHotels()}
 async function loadHistory(){if(!selected){hist=[];insights=null;$('#history').innerHTML='';$('#nohistory').hidden=false;drawInsights();drawChart();return}let airport=hotels.find(h=>h.id===selected)?.airport_code||'DEFAULT';let params=new URLSearchParams();if(selectedDate)params.set('date',selectedDate);params.set('airport',airport);let d=await api(`hotels/${selected}/history?${params.toString()}`);hist=d.history;insights=d.analysis;drawInsights();$('#chartname').textContent=(hotels.find(h=>h.id===selected)?.name||'')+(selectedDate?' · wylot '+dateOnly(selectedDate):' · cena za osobę');$('#history').innerHTML=hist.map((x,i)=>`<tr><td>${date(x.checked_at)}</td><td>${money(x.price)} / os.</td><td>${x.change===null?'—':`${x.change<0?'−':'+'}${money(Math.abs(x.change))} (${x.change_percent===null?'—':`${x.change_percent<0?'−':'+'}${Math.abs(x.change_percent).toFixed(1)}%`})`}</td></tr>`).join('');$('#nohistory').hidden=hist.length>0;drawChart()}
@@ -569,7 +578,8 @@ function openAdd(){$('#modal').classList.add('show')}function closeAdd(){$('#mod
 async function addHotel(e){e.preventDefault();let f=new FormData(e.target);try{await api('hotels',{method:'POST',body:JSON.stringify({name:f.get('name'),url:f.get('url'),people_count:Number(f.get('people_count'))})});closeAdd();e.target.reset();await load();status('Hotel dodany')}catch(x){status(x.message,true)}}
 async function removeHotel(id){if(!confirm('Usunąć monitor razem z historią cen?'))return;try{await api(`hotels/${id}`,{method:'DELETE'});if(selected===id)selected=null;await load()}catch(e){status(e.message,true)}}
 async function checkNow(){let b=$('#check');b.disabled=true;status('Zlecam sprawdzenie w GitHub Actions…');try{let d=await api('check',{method:'POST'});status(d.message);setTimeout(load,20000)}catch(e){status(e.message,true)}finally{b.disabled=false}}
-window.addEventListener('resize',drawChart);load();setInterval(load,60000);
+async function loadAllAirportOptions(){for(const h of hotels){const date=h.provider==='rainbow'?(h.offers?.find(o=>o.status==='available')?.date||h.departure_date):null;await loadAirportOptions(h.id,date)}}
+window.addEventListener('resize',drawChart);load().then(loadAllAirportOptions);setInterval(load,60000);
 </script></body></html>'''
 
 @app.get("/assets/<path:filename>")
@@ -667,7 +677,7 @@ def api_add():
 @app.get("/api/hotels/<int:hid>/airports")
 @auth_required
 def api_airports(hid):
-    c=connect(); hotel=c.execute("SELECT url,airport_code,airport_name FROM hotels WHERE id=?",(hid,)).fetchone(); c.close()
+    c=connect(); hotel=c.execute("SELECT url,airport_code,airport_name,airport_options FROM hotels WHERE id=?",(hid,)).fetchone(); c.close()
     if not hotel: return jsonify(error="Nie znaleziono hotelu."),404
     departure_date=request.args.get("date")
     if is_rainbow_url(hotel["url"]) and not departure_date:
@@ -685,7 +695,11 @@ def api_airports(hid):
         return jsonify(airports=airports,warning=warning)
     except Exception as e:
         app.logger.warning("Could not inspect airports for hotel %s and %s: %s",hid,departure_date,e)
-        return jsonify(airports=[dict(code=hotel["airport_code"],name=hotel["airport_name"] or "Lotnisko z oferty")],warning="Nie udało się pobrać listy lotnisk dla tego terminu.")
+        try: cached=json.loads(hotel["airport_options"] or "[]")
+        except Exception: cached=[]
+        if is_itaka_url(hotel["url"]) and {o.get("code") for o in cached}==set(AIRPORT_NAMES): cached=[]
+        airports=cached if len(cached)>1 else [dict(code=hotel["airport_code"],name=hotel["airport_name"] or "Lotnisko z oferty")]
+        return jsonify(airports=airports,warning="Nie udało się odświeżyć lotnisk; pokazuję ostatnio zapisane dostępne dane." if len(airports)>1 else "Nie udało się pobrać listy lotnisk dla tego terminu.")
 
 @app.post("/api/hotels/<int:hid>/airport")
 @auth_required
