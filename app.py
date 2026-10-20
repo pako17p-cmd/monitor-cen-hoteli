@@ -225,7 +225,7 @@ def fetch_rainbow_offer(url, people_count=2):
             day_button.first.wait_for(state="visible",timeout=15000)
             seen={}
             def collect_visible_calendar_prices():
-                buttons=page.locator("button").evaluate_all("""buttons => buttons.map(b => ({label:b.getAttribute('aria-label')||b.getAttribute('title')||'', text:b.innerText||b.textContent||''}))""")
+                buttons=page.get_by_role("button").evaluate_all("""buttons => buttons.map(b => ({label:b.getAttribute('aria-label')||b.getAttribute('title')||'', text:b.innerText||b.textContent||''}))""")
                 for button in buttons:
                     found=parse_rainbow_calendar_price(button.get("label",""),button.get("text",""))
                     if found:
@@ -249,7 +249,7 @@ def fetch_rainbow_offer(url, people_count=2):
             collect_visible_calendar_prices()
             calendar_prices=list(seen.items())
             if not calendar_prices:
-                samples=page.locator("button").evaluate_all("""buttons => buttons.filter(b => /20\\d{2}/.test((b.getAttribute('aria-label')||'')+' '+(b.getAttribute('title')||'')+' '+(b.innerText||b.textContent||''))).slice(0,20).map(b => ({label:b.getAttribute('aria-label')||b.getAttribute('title')||'', text:b.innerText||b.textContent||''}))""")
+                samples=page.get_by_role("button").evaluate_all("""buttons => buttons.filter(b => /20\\d{2}/.test((b.getAttribute('aria-label')||'')+' '+(b.getAttribute('title')||'')+' '+(b.innerText||b.textContent||''))).slice(0,20).map(b => ({label:b.getAttribute('aria-label')||b.getAttribute('title')||'', text:b.innerText||b.textContent||''}))""")
                 app.logger.warning("Rainbow calendar sample buttons: %s",samples)
                 raise ValueError("Rainbow nie udostępniło cen w kalendarzu wyjazdów.")
         finally:
