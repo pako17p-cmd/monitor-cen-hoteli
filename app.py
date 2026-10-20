@@ -298,11 +298,11 @@ def itaka_airport_options(url):
         try:
             page=browser.new_page(locale="pl-PL",timezone_id="Europe/Warsaw")
             # Don't wait for ITAKA analytics and tracking requests to finish.
-            page.goto(url,wait_until="domcontentloaded",timeout=30000)
-            # Wait for the flight control when available, but don't let an unhydrated body
-            # locator block airport detection for 15 seconds on every hotel.
+            # ITAKA may keep DOMContentLoaded open because of analytics. Commit means
+            # navigation has started; offer controls can hydrate afterwards.
+            page.goto(url,wait_until="commit",timeout=20000)
             control=page.get_by_text(re.compile(r"Skąd i jak",re.I)).first
-            try: control.wait_for(state="visible",timeout=8000)
+            try: control.wait_for(state="visible",timeout=5000)
             except Exception: pass
             if control.count() and control.is_visible():
                 try: control.click(timeout=5000)
@@ -323,6 +323,31 @@ def itaka_airport_options(url):
         found.insert(0,{"code":current_code,"name":current_name})
     return found or [{"code":current_code,"name":current_name}]
 
+def dismiss_rainbow_cookie_overlay(page):
+    """Save the current necessary-only cookie choice, including delayed overlays."""
+    overlay=page.locator(".r-consent-bottom-notif__modal:visible")
+    for _ in range(3):
+        if not overlay.count(): return
+        save=page.get_by_role("button",name=re.compile(r"ZAPISZ I WYJDŹ",re.I)).last
+        try:
+            save.wait_for(state="visible",timeout=2500)
+        except Exception:
+            settings=page.get_by_role("button",name=re.compile(r"USTAWIENIA PLIKÓW COOKIE",re.I)).last
+            try:
+                settings.wait_for(state="visible",timeout=5000)
+                settings.click(timeout=10000)
+                save.wait_for(state="visible",timeout=8000)
+            except Exception as e:
+                labels=page.locator("button").evaluate_all("""els=>els.filter(b=>b.offsetParent!==null).map(b=>(b.innerText||b.textContent||'').trim()).filter(Boolean).slice(0,20)""")
+                app.logger.warning("Rainbow consent controls not ready; visible buttons: %s",labels)
+                raise ValueError("Rainbow wyświetliło okno cookies, ale nie załadowało jego przycisków.") from e
+        save.click(timeout=10000)
+        try: overlay.wait_for(state="hidden",timeout=10000)
+        except Exception: page.wait_for_timeout(500)
+    if overlay.count():
+        raise ValueError("Rainbow ponownie wyświetliło okno cookies.")
+
+
 def rainbow_airport_variants(url, departure_date=None, selected_code=None):
     """Inspect or select Rainbow flight alternatives for one specific departure date."""
     from playwright.sync_api import sync_playwright
@@ -335,27 +360,11 @@ def rainbow_airport_variants(url, departure_date=None, selected_code=None):
         try:
             page=browser.new_page(locale="pl-PL",timezone_id="Europe/Warsaw")
             page.goto(safe_url,wait_until="domcontentloaded",timeout=60000)
-            overlay=page.locator(".r-consent-bottom-notif__modal:visible")
-            for _ in range(3):
-                if not overlay.count(): break
-                save=page.get_by_role("button",name=re.compile(r"ZAPISZ I WYJDŹ",re.I)).last
-                if save.count() and save.is_visible(): save.click(timeout=10000)
-                else:
-                    settings=page.get_by_role("button",name=re.compile(r"USTAWIENIA PLIKÓW COOKIE",re.I)).last
-                    if not settings.count() or not settings.is_visible(): raise ValueError("Rainbow nie pozwoliło zamknąć okna cookies.")
-                    settings.click(timeout=10000)
-            overlay.wait_for(state="hidden",timeout=15000)
+            dismiss_rainbow_cookie_overlay(page)
             page.locator('[id-dti="loader"]').wait_for(state="hidden",timeout=30000)
-            overlay=page.locator(".r-consent-bottom-notif__modal:visible")
-            for _ in range(3):
-                if not overlay.count(): break
-                save=page.get_by_role("button",name=re.compile(r"ZAPISZ I WYJDŹ",re.I)).last
-                if save.count() and save.is_visible(): save.click(timeout=10000)
-                else:
-                    settings=page.get_by_role("button",name=re.compile(r"USTAWIENIA PLIKÓW COOKIE",re.I)).last
-                    if not settings.count() or not settings.is_visible(): raise ValueError("Rainbow ponownie wyświetliło okno cookies.")
-                    settings.click(timeout=10000)
-            overlay.wait_for(state="hidden",timeout=15000)
+            # Rainbow can mount the consent dialog again after its offer configurator
+            # finishes. Wait for the actual controls before retrying.
+            dismiss_rainbow_cookie_overlay(page)
             if target:
                 picker=page.get_by_role("button",name=re.compile(r"\d{2}\.\d{2}\.20\d{2}\s*[-–]\s*\d{2}\.\d{2}\.20\d{2}"))
                 picker.wait_for(state="visible",timeout=15000); picker.click()
@@ -373,13 +382,22 @@ def rainbow_airport_variants(url, departure_date=None, selected_code=None):
             choose=page.get_by_role("button",name=re.compile(r"WYBIERZ",re.I))
             choose.first.wait_for(state="visible",timeout=20000)
             page.wait_for_timeout(500)
-            # Read each alternate from its nearest card that contains exactly one
-            # WYBIERZ button. Broad ancestors also contain sibling flights and used to
-            # make every choice look like the currently selected airport.
-            cards=choose.evaluate_all("""buttons=>buttons.map((b,i)=>{let n=b,card='';for(let j=0;j<12&&n;j++,n=n.parentElement){const text=n.innerText||'';const count=[...n.querySelectorAll('button')].filter(x=>/^\\s*WYBIERZ\\s*$/i.test((x.innerText||x.textContent||'').trim())).length;if(count===1){card=text;break}}return {i,text:card||b.parentElement?.innerText||''}})""")
+            # Read each alternate from its nearest card, and attach its preceding
+            # date heading so options from other departure dates are excluded.
+            cards=choose.evaluate_all("""buttons=>{const heads=[...document.querySelectorAll('h1,h2,h3,h4,h5,[role="heading"]')];return buttons.map((b,i)=>{let n=b,card='';for(let j=0;j<12&&n;j++,n=n.parentElement){const text=n.innerText||'';const count=[...n.querySelectorAll('button')].filter(x=>/^\\s*WYBIERZ\\s*$/i.test((x.innerText||x.textContent||'').trim())).length;if(count===1){card=text;break}}const heading=heads.filter(h=>h.compareDocumentPosition(b)&Node.DOCUMENT_POSITION_FOLLOWING).map(h=>(h.innerText||h.textContent||'').trim()).reverse().find(t=>/\\d{1,2}\\s+(?:sty|lut|mar|kwi|maj|cze|lip|sie|wrz|paź|paz|lis|gru)\\s+20\\d{2}\\s*[-–]/i.test(t))||'';return {i,text:card||b.parentElement?.innerText||'',heading}})}""")
             airports=[]
             airport_re=re.compile(r"Warszawa(?:\s*(?:-|–)?\s*(?:Chopin|Modlin))?|Poznań|Katowice|Wrocław|Gdańsk|Kraków|Rzeszów|Łódź|Szczecin|Bydgoszcz",re.I)
+            date_heading_re=re.compile(r"(\d{1,2})\s+(sty|lut|mar|kwi|maj|cze|lip|sie|wrz|paź|paz|lis|gru)\s+(20\d{2})",re.I)
+            def is_for_selected_date(card):
+                if not target: return True
+                heading=date_heading_re.search(card.get("heading",""))
+                if not heading: return False
+                month=RAINBOW_MONTHS.get(heading.group(2).lower())
+                if not month: return False
+                try: return date_type.fromisoformat(f"{heading.group(3)}-{month}-{int(heading.group(1)):02d}")==target
+                except ValueError: return False
             for card in cards:
+                if not is_for_selected_date(card): continue
                 match=airport_re.search(card["text"])
                 if not match: continue
                 name=match.group(0).strip()
@@ -388,6 +406,7 @@ def rainbow_airport_variants(url, departure_date=None, selected_code=None):
             if selected_code:
                 target_index=None
                 for card in cards:
+                    if not is_for_selected_date(card): continue
                     match=airport_re.search(card["text"])
                     if match and rainbow_airport_key(match.group(0).strip())==selected_code:
                         target_index=card["i"]; break
@@ -604,7 +623,7 @@ function openAdd(){$('#modal').classList.add('show')}function closeAdd(){$('#mod
 async function addHotel(e){e.preventDefault();let f=new FormData(e.target);try{await api('hotels',{method:'POST',body:JSON.stringify({name:f.get('name'),url:f.get('url'),people_count:Number(f.get('people_count'))})});closeAdd();e.target.reset();await load();status('Hotel dodany')}catch(x){status(x.message,true)}}
 async function removeHotel(id){if(!confirm('Usunąć monitor razem z historią cen?'))return;try{await api(`hotels/${id}`,{method:'DELETE'});if(selected===id)selected=null;await load()}catch(e){status(e.message,true)}}
 async function checkNow(){let b=$('#check');b.disabled=true;status('Zlecam sprawdzenie w GitHub Actions…');try{let d=await api('check',{method:'POST'});status(d.message);setTimeout(load,20000)}catch(e){status(e.message,true)}finally{b.disabled=false}}
-async function loadAllAirportOptions(){const list=[...hotels];for(let i=0;i<list.length;i+=2){await Promise.allSettled(list.slice(i,i+2).map(h=>{const date=h.provider==='rainbow'?(h.offers?.find(o=>o.status==='available')?.date||h.departure_date):null;return loadAirportOptions(h.id,date)}))}}
+async function loadAllAirportOptions(){const airportDate=h=>h.provider==='rainbow'?(h.offers?.find(o=>o.status==='available')?.date||h.departure_date):null;const rainbow=hotels.filter(h=>h.provider==='rainbow');await Promise.allSettled(rainbow.map(h=>loadAirportOptions(h.id,airportDate(h))));const itaka=hotels.filter(h=>h.provider!=='rainbow');for(let i=0;i<itaka.length;i+=2){await Promise.allSettled(itaka.slice(i,i+2).map(h=>loadAirportOptions(h.id,airportDate(h))))}}
 window.addEventListener('resize',drawChart);load().then(loadAllAirportOptions);setInterval(load,60000);
 </script></body></html>'''
 
