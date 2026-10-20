@@ -164,6 +164,15 @@ def fetch_rainbow_offer(url, people_count=2):
             date_picker.click()
             day_button=page.get_by_role("button",name=re.compile(r"\d{1,2}\s+(?:sty|lut|mar|kwi|maj|cze|lip|sie|wrz|paź|paz|lis|gru)\s+20\d{2}",re.I))
             day_button.wait_for(state="visible",timeout=15000)
+            seen={}
+            def collect_visible_calendar_prices():
+                buttons=page.locator("button").evaluate_all("""buttons => buttons.map(b => ({label:b.getAttribute('aria-label')||b.getAttribute('title')||'', text:b.innerText||b.textContent||''}))""")
+                for button in buttons:
+                    label=" ".join((button.get("label",""),button.get("text",""))).strip()
+                    found=parse_rainbow_calendar_price(label)
+                    if found:
+                        seen[found[0]]=found[1]
+            collect_visible_calendar_prices()
             target_month=rainbow_calendar_target()
             for _ in range(4):
                 if page.get_by_text(target_month,exact=True).count():
@@ -172,16 +181,10 @@ def fetch_rainbow_offer(url, people_count=2):
                 if not next_button.count() or not next_button.is_visible():
                     break
                 next_button.click()
+                collect_visible_calendar_prices()
             if not page.get_by_text(target_month,exact=True).count():
                 raise ValueError(f"Rainbow nie otworzyło kalendarza do miesiąca {target_month}.")
-
-            buttons=page.locator("button").evaluate_all("""buttons => buttons.map(b => ({label:b.getAttribute('aria-label')||b.getAttribute('title')||'', text:b.innerText||b.textContent||''}))""")
-            seen={}
-            for button in buttons:
-                label=" ".join((button.get("label",""),button.get("text",""))).strip()
-                found=parse_rainbow_calendar_price(label)
-                if found:
-                    seen[found[0]]=found[1]
+            collect_visible_calendar_prices()
             calendar_prices=list(seen.items())
             if not calendar_prices:
                 raise ValueError("Rainbow nie udostępniło cen w kalendarzu wyjazdów.")
