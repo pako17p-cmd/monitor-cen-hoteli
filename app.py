@@ -207,7 +207,7 @@ def fetch_rainbow_offer(url, people_count=2):
                         seen[found[0]]=found[1]
             collect_visible_calendar_prices()
             target_month=rainbow_calendar_target()
-            target_year=re.search(r"(20\\d{2})$",target_month).group(1)
+            target_year=target_month[-4:]
             target_name=target_month.rsplit(" ",1)[0].casefold()
             target_month_number=next((number for number,name in RAINBOW_MONTH_NAMES.items() if name.casefold()==target_name),None)
             target_prefix=f"{target_year}-{target_month_number}-" if target_month_number else None
