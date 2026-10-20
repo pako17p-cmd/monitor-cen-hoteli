@@ -122,12 +122,16 @@ def parse_rainbow_calendar_price(label, visible_text=""):
     label=re.sub(r"\s+"," ",(label or "")).replace("\u00a0"," ").strip()
     visible_text=re.sub(r"\s+"," ",(visible_text or "")).replace("\u00a0"," ").strip()
     date_pattern=r"(?<!\d)(\d{1,2})\s+(sty|lut|mar|kwi|maj|cze|lip|sie|wrz|paź|paz|lis|gru)\s+(20\d{2})"
-    m=re.search(date_pattern,label,re.I) or re.search(date_pattern,visible_text,re.I)
+    source=label
+    m=re.search(date_pattern,label,re.I)
+    if not m:
+        source=visible_text
+        m=re.search(date_pattern,visible_text,re.I)
     if not m:
         return None
     month=RAINBOW_MONTHS.get(m.group(2).lower())
     raw=None
-    suffix=label[m.end():]
+    suffix=source[m.end():]
     direct=re.match(r"\s*[,·-]\s*([\d\s]+(?:[,.]\d{2})?)",suffix)
     if direct:
         raw=direct.group(1)
