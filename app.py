@@ -703,6 +703,10 @@ def run_checks():
             elif not calendar_prices and total is None and not calendar_observed:
                 continue
             c=connect()
+            if is_rainbow_url(h['url']) and h['airport_code']=="DEFAULT" and airport_code!="DEFAULT":
+                c.execute("UPDATE prices SET airport_code=? WHERE hotel_id=? AND airport_code='DEFAULT'",(airport_code,h['id']))
+                c.execute("INSERT OR IGNORE INTO tracked_departures_by_airport(hotel_id,airport_code,departure_date,last_seen_at,missing_checks,status,current_price,previous_price) SELECT hotel_id,?,departure_date,last_seen_at,missing_checks,status,current_price,previous_price FROM tracked_departures_by_airport WHERE hotel_id=? AND airport_code='DEFAULT'",(airport_code,h['id']))
+                c.execute("DELETE FROM tracked_departures_by_airport WHERE hotel_id=? AND airport_code='DEFAULT'",(h['id'],))
             if calendar_prices:
                 for date_value,person_price in calendar_prices:
                     previous=c.execute("SELECT price,per_person FROM prices WHERE hotel_id=? AND airport_code=? AND departure_date=? ORDER BY id DESC LIMIT 1",(h['id'],airport_code,date_value)).fetchone()
