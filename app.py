@@ -115,10 +115,35 @@ def is_supported_offer_url(url):
         or host=="r.pl" or host.endswith(".r.pl")
     )
 
+RAINBOW_MONTHS={"sty":"01","lut":"02","mar":"03","kwi":"04","maj":"05","cze":"06","lip":"07","sie":"08","wrz":"09","paź":"10","paz":"10","lis":"11","gru":"12"}
+RAINBOW_MONTH_NAMES={"01":"styczeń","02":"luty","03":"marzec","04":"kwiecień","05":"maj","06":"czerwiec","07":"lipiec","08":"sierpień","09":"wrzesień","10":"październik","11":"listopad","12":"grudzień"}
+
+def parse_rainbow_calendar_price(label):
+    label=re.sub(r"\s+"," ",(label or "")).replace("\u00a0"," ").strip()
+    m=re.search(r"(?<!\d)(\d{1,2})\s+(sty|lut|mar|kwi|maj|cze|lip|sie|wrz|paź|paz|lis|gru)\s+(20\d{2})(?:\s*[,·-]\s*([\d\s]+(?:[,.]\d{2})?))?",label,re.I)
+    if not m or not m.group(4):
+        return None
+    month=RAINBOW_MONTHS.get(m.group(2).lower())
+    raw=re.sub(r"\s","",m.group(4)).replace(",",".")
+    try:
+        price=float(raw)
+        departure=datetime.strptime(f"{m.group(3)}-{month}-{int(m.group(1)):02d}","%Y-%m-%d").date().isoformat()
+    except (TypeError,ValueError):
+        return None
+    return (departure,price) if month and price>0 else None
+
+def rainbow_calendar_target():
+    today=datetime.utcnow().date()
+    month_index=today.month-1+2
+    year=today.year+month_index//12
+    month=month_index%12+1
+    return f"{RAINBOW_MONTH_NAMES[f'{month:02d}']} {year}"
+
 def fetch_rainbow_offer(url, people_count=2):
-    """Read the currently selected Rainbow package from the rendered offer page."""
+    """Read the selected Rainbow offer and the visible departure-price calendar through the end of the second future month."""
     from playwright.sync_api import sync_playwright
     safe_url=sanitize_rainbow_url(url)
+    calendar_prices=[]
     with sync_playwright() as p:
         browser=p.chromium.launch(headless=True,args=["--no-sandbox"])
         try:
@@ -133,6 +158,36 @@ def fetch_rainbow_offer(url, people_count=2):
             image=page.locator('meta[property="og:image"]')
             if image.count():
                 image_url=image.first.get_attribute("content")
+
+            date_picker=page.get_by_role("button",name=re.compile(r"\d{2}\.\d{2}\.20\d{2}\s*[-–]\s*\d{2}\.\d{2}\.20\d{2}"))
+            date_picker.wait_for(state="visible",timeout=15000)
+            date_picker.click()
+            day_button=page.get_by_role("button",name=re.compile(r"\d{1,2}\s+(?:sty|lut|mar|kwi|maj|cze|lip|sie|wrz|paź|paz|lis|gru)\s+20\d{2}",re.I))
+            day_button.wait_for(state="visible",timeout=15000)
+            seen={}
+            def collect_visible_calendar_prices():
+                buttons=page.locator("button").evaluate_all("""buttons => buttons.map(b => ({label:b.getAttribute('aria-label')||b.getAttribute('title')||'', text:b.innerText||b.textContent||''}))""")
+                for button in buttons:
+                    label=" ".join((button.get("label",""),button.get("text",""))).strip()
+                    found=parse_rainbow_calendar_price(label)
+                    if found:
+                        seen[found[0]]=found[1]
+            collect_visible_calendar_prices()
+            target_month=rainbow_calendar_target()
+            for _ in range(4):
+                if page.get_by_text(target_month,exact=True).count():
+                    break
+                next_button=page.get_by_role("button",name="Następna",exact=True)
+                if not next_button.count() or not next_button.is_visible():
+                    break
+                next_button.click()
+                collect_visible_calendar_prices()
+            if not page.get_by_text(target_month,exact=True).count():
+                raise ValueError(f"Rainbow nie otworzyło kalendarza do miesiąca {target_month}.")
+            collect_visible_calendar_prices()
+            calendar_prices=list(seen.items())
+            if not calendar_prices:
+                raise ValueError("Rainbow nie udostępniło cen w kalendarzu wyjazdów.")
         finally:
             browser.close()
     text=re.sub(r"\s+"," ",page_text).replace("\u00a0"," ")
@@ -154,7 +209,7 @@ def fetch_rainbow_offer(url, people_count=2):
     departure_date=datetime.strptime(date_matches[-1].group(1),"%d.%m.%Y").date().isoformat()
     image_url=urljoin(url,image_url) if image_url else None
     if image_url and urlparse(image_url).scheme!="https": image_url=None
-    return total,image_url,departure_date,[],False
+    return total,image_url,departure_date,calendar_prices,True
 
 def fetch_offer(url, people_count=2):
     if is_rainbow_url(url):
