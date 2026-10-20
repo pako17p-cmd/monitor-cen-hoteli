@@ -287,6 +287,39 @@ def rainbow_airport_key(name):
     normalized=name.upper().replace("Ł","L").replace("Ó","O").replace("Ą","A").replace("Ę","E").replace("Ś","S").replace("Ć","C").replace("Ń","N").replace("Ż","Z").replace("Ź","Z")
     return "R-"+re.sub(r"[^A-Z0-9]+","-",normalized).strip("-")
 
+def itaka_airport_options(url):
+    """Return only enabled departure airports shown on this ITAKA offer."""
+    from playwright.sync_api import sync_playwright
+    current_code,current_name=airport_code_from_url(url)
+    found=[]
+    code_by_label={name.casefold():code for code,name in AIRPORT_NAMES.items()}
+    with sync_playwright() as p:
+        browser=p.chromium.launch(headless=True,args=["--no-sandbox"])
+        try:
+            page=browser.new_page(locale="pl-PL",timezone_id="Europe/Warsaw")
+            page.goto(url,wait_until="domcontentloaded",timeout=60000)
+            page.locator("body").wait_for(state="visible",timeout=15000)
+            page.wait_for_timeout(1200)
+            control=page.get_by_text(re.compile(r"Skąd i jak",re.I)).first
+            if control.count() and control.is_visible():
+                try: control.click(timeout=5000)
+                except Exception: pass
+            page.wait_for_timeout(400)
+            items=page.locator('input[type="checkbox"]').evaluate_all("""els=>els.map(e=>({value:(e.value||'').toUpperCase(),disabled:e.disabled,label:[...(e.labels||[])].map(x=>x.innerText||'').join(' ')+' '+(e.parentElement?.innerText||'')}))""")
+            for item in items:
+                if item["disabled"]: continue
+                label=re.sub(r"\\s+"," ",item["label"]).strip()
+                code=item["value"] if item["value"] in AIRPORT_NAMES else None
+                if not code:
+                    code=next((c for name,c in code_by_label.items() if name in label.casefold()),None)
+                if code and not any(o["code"]==code for o in found):
+                    found.append({"code":code,"name":AIRPORT_NAMES[code]})
+        finally:
+            browser.close()
+    if current_code in AIRPORT_NAMES and not any(o["code"]==current_code for o in found):
+        found.insert(0,{"code":current_code,"name":current_name})
+    return found or [{"code":current_code,"name":current_name}]
+
 def rainbow_airport_variants(url, departure_date=None, selected_code=None):
     """Inspect or select Rainbow flight alternatives for one specific departure date."""
     from playwright.sync_api import sync_playwright
@@ -332,13 +365,14 @@ def rainbow_airport_variants(url, departure_date=None, selected_code=None):
                     nxt.click(); page.wait_for_timeout(150)
                 if not target_button.count() or not target_button.first.is_visible(): raise ValueError(f"Rainbow nie udostępniło terminu {label}.")
                 target_button.first.click(); page.locator('[id-dti="loader"]').wait_for(state="hidden",timeout=30000)
-            flight=page.get_by_role("button",name=re.compile(r"wylot\s+\d{1,2}:\d{2}",re.I)).first
+            flight=page.get_by_role("button",name=re.compile(r"wylot\\s+\\d{1,2}:\\d{2}",re.I)).first
             flight.wait_for(state="visible",timeout=15000); flight.click()
             choose=page.get_by_role("button",name=re.compile(r"WYBIERZ",re.I))
-            choose.first.wait_for(state="visible",timeout=15000)
-            cards=choose.evaluate_all("""buttons=>buttons.map((b,i)=>{let n=b,texts=[];for(let j=0;j<6&&n;j++,n=n.parentElement)texts.push(n.innerText||'');return {i,texts}})""")
+            choose.first.wait_for(state="visible",timeout=20000)
+            page.wait_for_timeout(500)
+            cards=choose.evaluate_all("""buttons=>buttons.map((b,i)=>{let n=b,texts=[];for(let j=0;j<12&&n;j++,n=n.parentElement)texts.push(n.innerText||'');return {i,texts}})""")
             airports=[]
-            airport_re=re.compile(r"Warszawa(?:\s+Chopin)?|Poznań|Katowice|Wrocław|Gdańsk|Kraków|Rzeszów|Łódź|Szczecin|Bydgoszcz",re.I)
+            airport_re=re.compile(r"Warszawa(?:\\s*(?:-|–)?\\s*(?:Chopin|Modlin))?|Poznań|Katowice|Wrocław|Gdańsk|Kraków|Rzeszów|Łódź|Szczecin|Bydgoszcz",re.I)
             for card in cards:
                 match=next((m for t in card["texts"] if (m:=airport_re.search(t))),None)
                 if not match: continue
@@ -526,7 +560,7 @@ async function load(){try{let d=await api('hotels');hotels=d.hotels;if(!selected
 function status(t,bad=false){$('#status').textContent=t;$('#status').style.color=bad?'#b42318':''}
 function drawHotels(){let root=$('#hotels');if(!hotels.length){root.innerHTML='<div class="empty">Dodaj hotel, aby rozpocząć monitorowanie.</div>';return}root.innerHTML=hotels.map(h=>{let chosenDate=selected===h.id&&selectedDate?h.offers.find(o=>o.date===selectedDate):null;let shownDate=chosenDate?.date||h.departure_date;let shownPrice=chosenDate?.price??h.price;let shownTotal=shownPrice===null?null:shownPrice*h.people_count;let active=h.offers.filter(o=>o.status==='available');let cheapest=active.length?Math.min(...active.map(o=>o.price)):null;return `<article class="hotel" onclick="selectHotel(${h.id})">${h.image_url?`<img class="thumb" src="${esc(h.image_url)}" alt="" loading="lazy" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'thumb missing',textContent:'🏝️'}))">`:`<div class="thumb missing">🏝️</div>`}<div><div class="hotelname">${esc(h.name)}</div><div class="meta">${esc(h.country||'Kraj nieustalony')} · ${h.people_count} os. · Wylot: ${dateOnly(shownDate)} · ${h.checked?`Ostatni odczyt: ${date(h.checked)}`:'Oczekuje na pierwszy odczyt'}</div><div class="meta airport-label">Lotnisko: ${esc(h.airport_name||'Lotnisko z oferty')}</div>${h.airport_options?.length>1?`<select class="airport-select" onclick="event.stopPropagation()" onchange="changeAirport(${h.id},this.value)"><option value="">Zmień lotnisko…</option>${h.airport_options.map(o=>`<option value="${esc(o.code)}" ${o.code===h.airport_code?'selected':''}>${esc(o.name)}</option>`).join('')}</select>`:''}</div><div class="pricebox"><div class="price">${shownPrice===null?'—':money(shownPrice)} / os.</div>${shownTotal===null?'':`<div class="meta">Łącznie: ${money(shownTotal)}</div>`}</div><div class="rowbuttons"><button class="history-btn small" onclick="event.stopPropagation();selectHotel(${h.id},'${shownDate||''}')">Historia</button><button class="offer-btn small" onclick="event.stopPropagation();window.open('${esc(h.url)}','_blank')">Otwórz ofertę</button><button class="delete-btn small" onclick="event.stopPropagation();removeHotel(${h.id})">Usuń</button><button class="terms-btn small" onclick="event.stopPropagation();toggleDates(${h.id})">Terminy i ceny (${h.offers.length})</button></div><div class="departures ${expandedHotels.has(h.id)?'show':''}">${h.offers.length?h.offers.map(o=>{let inactive=o.status!=='available';return `<button class="departure-choice ${inactive?'inactive ':''}${selected===h.id&&selectedDate===o.date?'active':''}" onclick="event.stopPropagation();selectHotel(${h.id},'${o.date}')"><span>${inactive?`<s>Wylot ${dateOnly(o.date)} · ${money(o.price)} / os.</s>`:`Wylot ${dateOnly(o.date)} · ${money(o.price)} / os.`}</span>${o.status==='expired'?'<span class="term-status">Termin minął</span>':o.status==='unavailable'?'<span class="term-status">Oferta niedostępna</span>':''}${!inactive&&o.price===cheapest?'<span class="best-badge">Najtaniej</span>':''}</button>`}).join(''):'<span class="meta">Kalendarz terminów będzie dostępny po odczycie ITAKA.</span>'}</div></article>`}).join('')}
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-async function selectHotel(id,departure){selected=id;selectedDate=departure||hotels.find(h=>h.id===id)?.offers?.[0]?.date||null;drawHotels();await loadHistory();let h=hotels.find(x=>x.id===id);if(h?.provider==='rainbow'&&selectedDate){try{let d=await api(`hotels/${id}/airports?date=${encodeURIComponent(selectedDate)}`);h.airport_options=d.airports||[];if(h.airport_code&&!h.airport_options.some(o=>o.code===h.airport_code))h.airport_options.unshift({code:h.airport_code,name:h.airport_name||'Obecne lotnisko'});drawHotels()}catch(e){}}}
+async function selectHotel(id,departure){selected=id;selectedDate=departure||hotels.find(h=>h.id===id)?.offers?.[0]?.date||null;drawHotels();await loadHistory();let h=hotels.find(x=>x.id===id);if(h?.provider==='rainbow'&&selectedDate||h?.provider==='itaka'){try{let url=`hotels/${id}/airports`;if(selectedDate)url+=`?date=${encodeURIComponent(selectedDate)}`;let d=await api(url);h.airport_options=d.airports||[];if(h.airport_code&&h.airport_code!=='DEFAULT'&&!h.airport_options.some(o=>o.code===h.airport_code))h.airport_options.unshift({code:h.airport_code,name:h.airport_name||'Obecne lotnisko'});drawHotels();if(d.warning)status(d.warning,true)}catch(e){status(e.message,true)}}}
 async function changeAirport(id,code){if(!code)return;try{let result=await api(`hotels/${id}/airport`,{method:'POST',body:JSON.stringify({airport_code:code,date:selectedDate})});status(result.message||'Zmieniono lotnisko');await load();if(selected===id)await loadHistory()}catch(e){status(e.message,true);await load()}}
 function toggleDates(id){expandedHotels.has(id)?expandedHotels.delete(id):expandedHotels.add(id);drawHotels()}
 async function loadHistory(){if(!selected){hist=[];insights=null;$('#history').innerHTML='';$('#nohistory').hidden=false;drawInsights();drawChart();return}let airport=hotels.find(h=>h.id===selected)?.airport_code||'DEFAULT';let params=new URLSearchParams();if(selectedDate)params.set('date',selectedDate);params.set('airport',airport);let d=await api(`hotels/${selected}/history?${params.toString()}`);hist=d.history;insights=d.analysis;drawInsights();$('#chartname').textContent=(hotels.find(h=>h.id===selected)?.name||'')+(selectedDate?' · wylot '+dateOnly(selectedDate):' · cena za osobę');$('#history').innerHTML=hist.map((x,i)=>`<tr><td>${date(x.checked_at)}</td><td>${money(x.price)} / os.</td><td>${x.change===null?'—':`${x.change<0?'−':'+'}${money(Math.abs(x.change))} (${x.change_percent===null?'—':`${x.change_percent<0?'−':'+'}${Math.abs(x.change_percent).toFixed(1)}%`})`}</td></tr>`).join('');$('#nohistory').hidden=hist.length>0;drawChart()}
@@ -568,11 +602,7 @@ def api_hotels():
     for h in rows:
         try: airport_options=json.loads(h['airport_options'] or "[]")
         except Exception: airport_options=[]
-        if is_itaka_url(h['url']):
-            airport_options=[dict(code=code,name=name) for code,name in AIRPORT_NAMES.items()]
-            if h['airport_code'] not in AIRPORT_NAMES:
-                airport_options.insert(0,dict(code=h['airport_code'],name=h['airport_name'] or "Lotnisko z oferty"))
-        elif not airport_options:
+        if not airport_options:
             airport_options=[dict(code=h['airport_code'],name=h['airport_name'] or "Lotnisko z oferty")]
         hotel_offers=offers.get((h['id'],h['airport_code']),[])
         hotel_offers.sort(key=lambda o:(o['status']!='available',o['date'] if o['status']=='available' else o['date']))
@@ -637,14 +667,22 @@ def api_airports(hid):
     c=connect(); hotel=c.execute("SELECT url,airport_code,airport_name FROM hotels WHERE id=?",(hid,)).fetchone(); c.close()
     if not hotel: return jsonify(error="Nie znaleziono hotelu."),404
     departure_date=request.args.get("date")
-    if not is_rainbow_url(hotel["url"]): return jsonify(airports=[dict(code=k,name=v) for k,v in AIRPORT_NAMES.items()])
-    if not departure_date: return jsonify(airports=[dict(code=hotel["airport_code"],name=hotel["airport_name"] or "Lotnisko z oferty")])
+    if is_rainbow_url(hotel["url"]) and not departure_date:
+        return jsonify(airports=[dict(code=hotel["airport_code"],name=hotel["airport_name"] or "Lotnisko z oferty")])
     try:
-        result=rainbow_airport_variants(hotel["url"],departure_date)
-        return jsonify(airports=result["airports"])
+        if is_rainbow_url(hotel["url"]):
+            result=rainbow_airport_variants(hotel["url"],departure_date)
+            airports=result["airports"]
+        else:
+            airports=itaka_airport_options(hotel["url"])
+        if hotel["airport_code"] and hotel["airport_code"]!="DEFAULT" and not any(a["code"]==hotel["airport_code"] for a in airports):
+            airports.insert(0,dict(code=hotel["airport_code"],name=hotel["airport_name"] or "Obecne lotnisko"))
+        c=connect(); c.execute("UPDATE hotels SET airport_options=? WHERE id=?",(json.dumps(airports,ensure_ascii=False),hid)); c.commit(); c.close()
+        warning="Nie znaleziono innych lotnisk dla tego terminu." if len(airports)<=1 else None
+        return jsonify(airports=airports,warning=warning)
     except Exception as e:
-        app.logger.warning("Could not inspect Rainbow airports for hotel %s and %s: %s",hid,departure_date,e)
-        return jsonify(airports=[dict(code=hotel["airport_code"],name=hotel["airport_name"] or "Lotnisko z oferty")],warning="Nie udało się pobrać innych lotnisk dla tego terminu.")
+        app.logger.warning("Could not inspect airports for hotel %s and %s: %s",hid,departure_date,e)
+        return jsonify(airports=[dict(code=hotel["airport_code"],name=hotel["airport_name"] or "Lotnisko z oferty")],warning="Nie udało się pobrać listy lotnisk dla tego terminu.")
 
 @app.post("/api/hotels/<int:hid>/airport")
 @auth_required
@@ -670,7 +708,10 @@ def api_set_airport(hid):
         query=[(key,value) for key,value in query if key!="airports"]
         query.append(("airports",code))
         parsed=urlparse(hotel["url"]); new_url=urlunparse(parsed._replace(query=urlencode(query,doseq=True)))
-        airport_name=AIRPORT_NAMES[code]; options=[dict(code=k,name=v) for k,v in AIRPORT_NAMES.items()]
+        airport_name=AIRPORT_NAMES[code]
+        try: options=json.loads(c.execute("SELECT airport_options FROM hotels WHERE id=?",(hid,)).fetchone()["airport_options"] or "[]")
+        except Exception: options=[]
+        if not any(item.get("code")==code for item in options): options.insert(0,dict(code=code,name=airport_name))
     c.execute("UPDATE hotels SET url=?,airport_code=?,airport_name=?,airport_options=? WHERE id=?",(new_url,code,airport_name,json.dumps(options,ensure_ascii=False),hid)); c.commit(); c.close()
     try:
         save_state_to_github()
@@ -725,8 +766,7 @@ def run_checks():
                 for record in known:
                     if record['departure_date'] not in seen_dates:
                         c.execute("UPDATE tracked_departures_by_airport SET missing_checks=missing_checks+1,status=CASE WHEN missing_checks+1>=2 THEN 'unavailable' ELSE status END WHERE hotel_id=? AND airport_code=? AND departure_date=?",(h['id'],airport_code,record['departure_date']))
-            options=json.dumps([dict(code=airport_code,name=airport_name)],ensure_ascii=False) if is_rainbow_url(h['url']) else json.dumps([dict(code=k,name=v) for k,v in AIRPORT_NAMES.items()],ensure_ascii=False)
-            c.execute("UPDATE hotels SET image_url=COALESCE(?,image_url),last_checked_at=?,country=?,airport_code=?,airport_name=?,airport_options=? WHERE id=?",(image_url,stamp,country_from_url(h['url']),airport_code,airport_name,options,h['id']))
+            c.execute("UPDATE hotels SET image_url=COALESCE(?,image_url),last_checked_at=?,country=?,airport_code=?,airport_name=? WHERE id=?",(image_url,stamp,country_from_url(h['url']),airport_code,airport_name,h['id']))
             c.commit(); c.close()
         except Exception as e:
             errors+=1; app.logger.warning("Price check failed for hotel %s: %s",h['id'],e)
