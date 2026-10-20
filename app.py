@@ -153,6 +153,19 @@ def fetch_rainbow_offer(url, people_count=2):
                 page.get_by_text(re.compile(r"Cena\s+razem",re.I)).first.wait_for(state="visible",timeout=30000)
             except Exception:
                 page.locator("body").wait_for(state="visible",timeout=10000)
+
+            # Rainbow blocks the offer calendar with a consent dialog on a fresh browser.
+            # Keep optional cookies disabled: open settings and save the required-only defaults.
+            cookie_settings=page.get_by_role("button",name=re.compile(r"USTAWIENIA PLIKÓW COOKIE",re.I))
+            if cookie_settings.count() and cookie_settings.first.is_visible():
+                cookie_settings.first.click(timeout=10000)
+                save_settings=page.get_by_role("button",name=re.compile(r"ZAPISZ I WYJDŹ",re.I))
+                save_settings.wait_for(state="visible",timeout=10000)
+                save_settings.click(timeout=10000)
+                page.locator(".r-consent-bottom-notif__modal").wait_for(state="hidden",timeout=15000)
+
+            # Wait until the offer configurator has finished loading before clicking its controls.
+            page.locator('[id-dti="loader"]').wait_for(state="hidden",timeout=30000)
             page_text=page.locator("body").inner_text(timeout=20000)
             image_url=None
             image=page.locator('meta[property="og:image"]')
