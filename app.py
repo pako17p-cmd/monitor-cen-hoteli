@@ -752,8 +752,8 @@ def refresh_airport_options():
             by_date=cached.get("by_date",{}) if isinstance(cached,dict) else {}
             c=connect()
             dates=[row["departure_date"] for row in c.execute(
-                "SELECT DISTINCT departure_date FROM prices WHERE hotel_id=? AND departure_date>=date('now') AND departure_date<=? ORDER BY departure_date",
-                (hotel["id"],horizon)
+                "SELECT DISTINCT p.departure_date FROM prices p LEFT JOIN tracked_departures_by_airport d ON d.hotel_id=p.hotel_id AND d.airport_code=p.airport_code AND d.departure_date=p.departure_date WHERE p.hotel_id=? AND p.airport_code=? AND p.departure_date>=date('now') AND p.departure_date<=? AND COALESCE(d.status,'available')='available' ORDER BY p.departure_date",
+                (hotel["id"],hotel["airport_code"],horizon)
             )]
             c.close()
             for departure_date in dates:
