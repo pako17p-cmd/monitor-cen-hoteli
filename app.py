@@ -6,7 +6,7 @@ from functools import wraps
 from flask import Flask, request, jsonify, session, redirect, render_template_string, send_from_directory
 from werkzeug.middleware.proxy_fix import ProxyFix
 import urllib.request
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 import github_state
 
 app = Flask(__name__)
@@ -96,7 +96,70 @@ def fetch_dynamic_calendar(url):
         if found: result.append(found)
     return list(dict(result).items())
 
-def fetch_offer(url):
+def is_rainbow_url(url):
+    host=(urlparse(url).hostname or "").lower()
+    return urlparse(url).scheme=="https" and (host=="r.pl" or host.endswith(".r.pl"))
+
+def sanitize_rainbow_url(url):
+    """Remove passenger birth-date query values while keeping the offer key."""
+    parts=urlparse(url)
+    query=[(key,value) for key,value in parse_qsl(parts.query,keep_blank_values=True)
+           if not key.lower().startswith(("wiek","dataurodzenia","birth"))]
+    return urlunparse(parts._replace(query=urlencode(query)))
+
+def is_supported_offer_url(url):
+    parts=urlparse(url)
+    host=(parts.hostname or "").lower()
+    return parts.scheme=="https" and (
+        host=="www.itaka.pl" or host=="itaka.pl" or host.endswith(".itaka.pl")
+        or host=="r.pl" or host.endswith(".r.pl")
+    )
+
+def fetch_rainbow_offer(url, people_count=2):
+    """Read the currently selected Rainbow package from the rendered offer page."""
+    from playwright.sync_api import sync_playwright
+    safe_url=sanitize_rainbow_url(url)
+    with sync_playwright() as p:
+        browser=p.chromium.launch(headless=True,args=["--no-sandbox"])
+        try:
+            page=browser.new_page(locale="pl-PL",timezone_id="Europe/Warsaw")
+            page.goto(safe_url,wait_until="domcontentloaded",timeout=60000)
+            try:
+                page.get_by_text(re.compile(r"Cena\\s+razem",re.I)).first.wait_for(state="visible",timeout=30000)
+            except Exception:
+                page.locator("body").wait_for(state="visible",timeout=10000)
+            page_text=page.locator("body").inner_text(timeout=20000)
+            image_url=None
+            image=page.locator('meta[property="og:image"]')
+            if image.count():
+                image_url=image.first.get_attribute("content")
+        finally:
+            browser.close()
+    text=re.sub(r"\\s+"," ",page_text).replace("\\u00a0"," ")
+    total_match=re.search(r"Cena\\s+razem\\s*:?\\s*([\\d\\s.,]+)\\s*zł",text,re.I)
+    if total_match:
+        raw=re.sub(r"\\s","",total_match.group(1)).replace(",",".")
+        total=float(raw)
+    else:
+        per_person_match=re.search(r"([\\d\\s.,]+)\\s*zł\\s*/\\s*os\\.",text,re.I)
+        if not per_person_match:
+            raise ValueError("Rainbow nie udostępniło teraz ceny wybranej oferty.")
+        raw=re.sub(r"\\s","",per_person_match.group(1)).replace(",",".")
+        total=round(float(raw)*max(1,int(people_count)),2)
+    price_position=total_match.start() if total_match else per_person_match.start()
+    nearby=text[max(0,price_position-1200):price_position]
+    date_matches=list(re.finditer(r"(?<!\\d)(\\d{2}\\.\\d{2}\\.20\\d{2})\\s*[-–]\\s*\\d{2}\\.\\d{2}\\.20\\d{2}",nearby))
+    if not date_matches:
+        raise ValueError("Rainbow nie udostępniło daty wybranego wylotu.")
+    departure_date=datetime.strptime(date_matches[-1].group(1),"%d.%m.%Y").date().isoformat()
+    image_url=urljoin(url,image_url) if image_url else None
+    if image_url and urlparse(image_url).scheme!="https": image_url=None
+    return total,image_url,departure_date,[],False
+
+def fetch_offer(url, people_count=2):
+    if is_rainbow_url(url):
+        return fetch_rainbow_offer(url,people_count)
+
     req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36","Accept-Language":"pl-PL,pl;q=0.9"})
     with urllib.request.urlopen(req,timeout=35) as res: html=res.read().decode(res.headers.get_content_charset() or "utf-8",errors="replace")
     p=Extractor(); p.feed(html); text=re.sub(r"\s+"," "," ".join(p.parts))
@@ -222,8 +285,8 @@ def logout(): session.clear(); return redirect("/login")
 
 PAGE='''<!doctype html><html lang="pl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#123f50"><title>Ceny hoteli</title><style>
 :root{--ink:#153a43;--muted:#75858c;--teal:#138274;--bg:#f2f6f5;--line:#e6eceb}*{box-sizing:border-box}body{margin:0;background:#f7f5f0;color:var(--ink);font:15px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}header{position:relative;isolation:isolate;overflow:hidden;text-align:center;color:#fff;min-height:190px;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:calc(26px + env(safe-area-inset-top)) 18px 34px;background:#087b91 url("/assets/background.webp") center 52%/cover no-repeat}header:after{content:"";position:absolute;z-index:-1;left:-5%;right:-5%;height:44px;bottom:-22px;border-radius:50% 50% 0 0/100% 100% 0 0;background:#f7f5f0;opacity:.96}header h1{margin:0 0 4px;line-height:0}header h1 img{display:block;width:min(360px,78vw);height:auto;max-height:96px;object-fit:contain}header p{margin:5px 0 0;color:#fff;font-size:14px;text-shadow:0 1px 5px #073746aa}.wrap{max-width:1300px;padding:18px 22px;margin:-20px auto 0;position:relative}.actions{display:flex;gap:9px;flex-wrap:wrap;margin-bottom:14px}button{border:0;border-radius:11px;padding:12px 15px;font:600 14px inherit;cursor:pointer}.primary{background:var(--teal);color:white}.secondary{background:#fff;color:var(--ink);box-shadow:0 1px 3px #102f3612}.danger{color:#a53943;background:transparent}.history-btn{background:#eef7fc;color:#0878a6}.offer-btn{background:#148879;color:#fff;box-shadow:0 2px 6px #12827426}.delete-btn{background:#fff0ef;color:#c83232}.terms-btn{background:#f1f7f7;color:#226b72}.departure-choice{background:#fff;border:1px solid var(--line);color:var(--ink);padding:9px 12px;border-radius:10px}.departures{display:none;grid-column:1/-1;padding:12px 0 2px;gap:8px;flex-wrap:wrap}.departures.show{display:flex}.departure-choice.active{border-color:#148879;background:#eef8f5;color:#08786e;font-weight:700}.card{background:white;border:1px solid var(--line);border-radius:16px;padding:16px;margin:12px 0;box-shadow:0 4px 14px #173d3c08}.card h2{font-size:17px;margin:0 0 12px}.hotel{display:grid;grid-template-columns:82px minmax(0,1fr);column-gap:14px;align-items:center;padding:14px 0;border-top:1px solid var(--line);cursor:pointer}.hotel:first-of-type{border:0}.thumb{width:82px;height:82px;object-fit:cover;border-radius:12px;background:#dff0ed;grid-row:1 / span 2}.thumb.missing{display:grid;place-items:center;color:#fff;font-size:25px;background:linear-gradient(140deg,#f3cf8c,#78c4bd 55%,#347f96)}.hotelname{font-weight:700}.price{font-size:21px;font-weight:750;color:#08786e;white-space:nowrap}.pricebox{background:#eef8f5;border-radius:12px;padding:12px 15px;text-align:center}.meta{color:var(--muted);font-size:12px;margin-top:5px}.rowbuttons{display:flex;gap:8px;align-items:center;margin-top:8px;grid-column:2/-1}.small{padding:8px 10px;font-size:12px}.chartwrap{height:230px}canvas{width:100%;height:100%}.tablewrap{overflow:auto}table{border-collapse:collapse;width:100%;font-size:13px}td,th{text-align:left;padding:11px 8px;border-bottom:1px solid var(--line);white-space:nowrap}th{color:var(--muted);font-weight:600}.note{font-size:12px;color:var(--muted);line-height:1.5}.modal{position:fixed;inset:0;background:#0e293b78;display:none;place-items:center;padding:18px}.modal.show{display:grid}.dialog{background:white;border-radius:18px;padding:22px;width:min(100%,430px)}.dialog h2{margin-top:0}.dialog input{width:100%;padding:12px;border:1px solid #cbd7d5;border-radius:10px;margin:6px 0 12px;font:inherit}.dialog label{font-size:13px;font-weight:650}.dialog .actions{margin:8px 0 0}.empty{color:var(--muted);padding:12px 0}.status{font-size:12px;color:var(--muted);margin-left:auto;align-self:center}@media(min-width:780px){.columns{display:grid;grid-template-columns:1fr 1fr;gap:14px}.columns .card{margin:0}.hotel{grid-template-columns:200px minmax(0,1fr) 270px;column-gap:22px;min-height:130px;padding:15px 0}.thumb{width:200px;height:112px;grid-row:1 / span 2}.hotel .rowbuttons{grid-column:2/-1;margin-top:12px}.chartwrap{height:260px}}
-.insight-grid{display:grid;grid-template-columns:1fr;gap:10px}.insight{background:#f7faf9;border:1px solid var(--line);border-radius:12px;padding:14px;min-width:0}.insight span,.insight small{display:block;color:var(--muted);font-size:12px}.insight strong{display:block;margin:8px 0 4px;color:#08786e;font-size:16px;line-height:1.45}.insight.muted{color:var(--muted)}.departure-choice.inactive{background:#f0f1f1;color:#7b8588;border-color:#e2e5e5}.departure-choice.inactive.active{border-color:#8d999c}.term-status{margin-left:9px;font-size:11px;color:#788285}.best-badge{margin-left:9px;border-radius:20px;background:#ddf3e9;color:#08786e;padding:3px 8px;font-size:11px}@media(min-width:780px){.insight-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}</style></head><body><header><h1><img src="/assets/napis.png" alt="Ceny hoteli"></h1><p>Historia ofert ITAKA · {{ "automatycznie co 2 godziny" if auto_check_enabled else "test · odczyt ręczny" }}</p></header><main class="wrap"><div class="actions"><button class="primary" onclick="openAdd()">＋ Dodaj hotel</button><button class="secondary" id="check" onclick="checkNow()">Sprawdź teraz</button><span class="status" id="status">Gotowe</span></div><section class="card"><h2>Monitorowane oferty</h2><div id="hotels"></div></section><section class="card"><h2>Analiza wybranego terminu</h2><div id="insights" class="insight-grid"></div></section><div class="columns"><section class="card"><h2>Wykres ceny za osobę</h2><div class="chartwrap"><canvas id="chart"></canvas></div><div class="meta" id="chartname">Wybierz hotel</div></section><section class="card"><h2>Historia odczytów</h2><div class="tablewrap"><table><thead><tr><th>Data i godzina</th><th>Cena / osoba</th><th>Zmiana / osoba</th></tr></thead><tbody id="history"></tbody></table></div><div class="empty" id="nohistory" hidden>Brak odczytów. Użyj „Sprawdź teraz”.</div></section></div><p class="note">Cena za osobę to łączna cena oferty podzielona przez liczbę podróżnych. Przy dodawaniu hotelu wpisz ich liczbę. Link ITAKA powinien zawierać wybrany termin i parametry wyjazdu.</p></main>
-<div class="modal" id="modal"><form class="dialog" onsubmit="addHotel(event)"><h2>Dodaj ofertę</h2><label>Nazwa hotelu<input name="name" required placeholder="np. Hotel nad morzem"></label><label>Pełny link do oferty ITAKA<input name="url" type="url" required placeholder="https://www.itaka.pl/..."></label><label>Liczba podróżnych<input name="people_count" type="number" min="1" max="20" value="2" required></label><div class="actions"><button type="button" class="secondary" onclick="closeAdd()">Anuluj</button><button class="primary">Zapisz hotel</button></div></form></div>
+.insight-grid{display:grid;grid-template-columns:1fr;gap:10px}.insight{background:#f7faf9;border:1px solid var(--line);border-radius:12px;padding:14px;min-width:0}.insight span,.insight small{display:block;color:var(--muted);font-size:12px}.insight strong{display:block;margin:8px 0 4px;color:#08786e;font-size:16px;line-height:1.45}.insight.muted{color:var(--muted)}.departure-choice.inactive{background:#f0f1f1;color:#7b8588;border-color:#e2e5e5}.departure-choice.inactive.active{border-color:#8d999c}.term-status{margin-left:9px;font-size:11px;color:#788285}.best-badge{margin-left:9px;border-radius:20px;background:#ddf3e9;color:#08786e;padding:3px 8px;font-size:11px}@media(min-width:780px){.insight-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}</style></head><body><header><h1><img src="/assets/napis.png" alt="Ceny hoteli"></h1><p>Historia ofert ITAKA · {{ "automatycznie co 2 godziny" if auto_check_enabled else "test · odczyt ręczny" }}</p></header><main class="wrap"><div class="actions"><button class="primary" onclick="openAdd()">＋ Dodaj hotel</button><button class="secondary" id="check" onclick="checkNow()">Sprawdź teraz</button><span class="status" id="status">Gotowe</span></div><section class="card"><h2>Monitorowane oferty</h2><div id="hotels"></div></section><section class="card"><h2>Analiza wybranego terminu</h2><div id="insights" class="insight-grid"></div></section><div class="columns"><section class="card"><h2>Wykres ceny za osobę</h2><div class="chartwrap"><canvas id="chart"></canvas></div><div class="meta" id="chartname">Wybierz hotel</div></section><section class="card"><h2>Historia odczytów</h2><div class="tablewrap"><table><thead><tr><th>Data i godzina</th><th>Cena / osoba</th><th>Zmiana / osoba</th></tr></thead><tbody id="history"></tbody></table></div><div class="empty" id="nohistory" hidden>Brak odczytów. Użyj „Sprawdź teraz”.</div></section></div><p class="note">Cena za osobę to łączna cena oferty podzielona przez liczbę podróżnych. Przy dodawaniu hotelu wpisz ich liczbę. Link do ITAKA lub Rainbow powinien zawierać wybrany termin i parametry wyjazdu. Dla Rainbow aplikacja zapamiętuje link do wybranej oferty bez dat urodzenia w parametrach.</p></main>
+<div class="modal" id="modal"><form class="dialog" onsubmit="addHotel(event)"><h2>Dodaj ofertę</h2><label>Nazwa hotelu<input name="name" required placeholder="np. Hotel nad morzem"></label><label>Pełny link do oferty ITAKA lub Rainbow<input name="url" type="url" required placeholder="https://www.itaka.pl/... lub https://r.pl/..."></label><label>Liczba podróżnych<input name="people_count" type="number" min="1" max="20" value="2" required></label><div class="actions"><button type="button" class="secondary" onclick="closeAdd()">Anuluj</button><button class="primary">Zapisz hotel</button></div></form></div>
 <script>
 let hotels=[], selected=null, hist=[], insights=null, selectedDate=null, expandedHotels=new Set(); const $=s=>document.querySelector(s); const money=v=>new Intl.NumberFormat('pl-PL',{style:'currency',currency:'PLN',maximumFractionDigits:2}).format(v); const date=s=>new Date(s+'Z').toLocaleString('pl-PL',{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'}); const dateOnly=s=>s?new Date(s+'T00:00:00').toLocaleDateString('pl-PL'):'—';
 async function api(path,opt={}){let r=await fetch('/api/'+path,{headers:{'Content-Type':'application/json'},...opt});if(r.status===401){location='/login';throw Error('Zaloguj się ponownie.')}let d=await r.json();if(!r.ok)throw Error(d.error||'Wystąpił błąd');return d}
@@ -317,7 +380,8 @@ def api_add():
     d=request.get_json(force=True); name=str(d.get('name','')).strip(); url=str(d.get('url','')).strip()
     try: people_count=int(d.get('people_count',2))
     except (TypeError,ValueError): people_count=0
-    if not name or not url.startswith('https://www.itaka.pl/') or not 1<=people_count<=20:return jsonify(error='Podaj nazwę, link ITAKA i liczbę podróżnych od 1 do 20.'),400
+    if not name or not is_supported_offer_url(url) or not 1<=people_count<=20:return jsonify(error='Podaj nazwę, poprawny link ITAKA lub Rainbow i liczbę podróżnych od 1 do 20.'),400
+    if is_rainbow_url(url): url=sanitize_rainbow_url(url)
     c=connect(); cur=c.execute("INSERT INTO hotels(name,url,people_count) VALUES(?,?,?)",(name,url,people_count)); hotel_id=cur.lastrowid; c.commit(); c.close()
     try: save_state_to_github()
     except Exception as e: app.logger.exception("Could not save added hotel to GitHub") ; return jsonify(error=f"Hotel został dodany lokalnie, ale nie udało się zapisać go w GitHubie: {e}"),503
@@ -333,7 +397,7 @@ def run_checks():
     c=connect(); hs=c.execute("SELECT id,url,people_count FROM hotels ORDER BY id").fetchall(); max_departure=c.execute("SELECT date('now','start of month','+3 months','-1 day')").fetchone()[0]; c.close(); errors=0
     for h in hs:
         try:
-            total,image_url,departure_date,calendar_prices,calendar_observed=fetch_offer(h['url']); stamp=datetime.utcnow().replace(microsecond=0).isoformat()
+            total,image_url,departure_date,calendar_prices,calendar_observed=fetch_offer(h['url'],h['people_count']); stamp=datetime.utcnow().replace(microsecond=0).isoformat()
             calendar_prices=[(d,p) for d,p in dict(calendar_prices).items() if datetime.strptime(d,"%Y-%m-%d").date()<=datetime.strptime(max_departure,"%Y-%m-%d").date()]
             if departure_date and departure_date<=max_departure and total is not None:
                 calendar_prices=[(d,total/h['people_count'] if d==departure_date else value) for d,value in calendar_prices]
@@ -348,7 +412,7 @@ def run_checks():
                     if old_price is None or abs(old_price-person_price)>=0.01:
                         c.execute("INSERT INTO prices(hotel_id,checked_at,price,departure_date,per_person) VALUES(?,?,?,?,1)",(h['id'],stamp,person_price,date_value))
             elif total is not None:
-                previous=c.execute("SELECT price FROM prices WHERE hotel_id=? AND departure_date IS NULL ORDER BY id DESC LIMIT 1",(h['id'],)).fetchone()
+                previous=c.execute("SELECT price FROM prices WHERE hotel_id=? AND departure_date IS ? ORDER BY id DESC LIMIT 1",(h['id'],departure_date)).fetchone()
                 if previous is None or abs(previous['price']-total)>=0.01:
                     c.execute("INSERT INTO prices(hotel_id,checked_at,price,departure_date,per_person) VALUES(?,?,?,?,0)",(h['id'],stamp,total,departure_date))
             if calendar_observed:
