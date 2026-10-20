@@ -339,6 +339,13 @@ def dismiss_rainbow_cookie_overlay(page):
                 save.wait_for(state="visible",timeout=8000)
             except Exception as e:
                 labels=page.locator("button").evaluate_all("""els=>els.filter(b=>b.offsetParent!==null).map(b=>(b.innerText||b.textContent||'').trim()).filter(Boolean).slice(0,20)""")
+                # Rainbow sometimes leaves a stale consent overlay in the DOM without its
+                # controls, although the actual date or flight control is already usable.
+                flight_control=page.get_by_role("button",name=re.compile(r"wylot[ ]+[0-9]{1,2}:[0-9]{2}",re.I)).first
+                date_control=page.get_by_role("button",name=re.compile(r"[0-9]{2}[.][0-9]{2}[.]20[0-9]{2}[ ]*[-–][ ]*[0-9]{2}[.][0-9]{2}[.]20[0-9]{2}"))
+                if (flight_control.count() and flight_control.is_visible()) or (date_control.count() and date_control.is_visible()):
+                    app.logger.warning("Rainbow consent overlay has no controls; continuing because offer controls are visible: %s",labels)
+                    return
                 app.logger.warning("Rainbow consent controls not ready; visible buttons: %s",labels)
                 raise ValueError("Rainbow wyświetliło okno cookies, ale nie załadowało jego przycisków.") from e
         save.click(timeout=10000)
@@ -361,24 +368,25 @@ def rainbow_airport_variants(url, departure_date=None, selected_code=None):
             page=browser.new_page(locale="pl-PL",timezone_id="Europe/Warsaw")
             page.goto(safe_url,wait_until="domcontentloaded",timeout=60000)
             dismiss_rainbow_cookie_overlay(page)
-            page.locator('[id-dti="loader"]').wait_for(state="hidden",timeout=30000)
-            # Rainbow can mount the consent dialog again after its offer configurator
-            # finishes. Wait for the actual controls before retrying.
-            dismiss_rainbow_cookie_overlay(page)
+            # Rainbow's overlay may remain visible forever while date/flight controls are active.
+            # Wait for the needed controls instead of waiting for this unrelated full-screen loader.
+            picker=page.get_by_role("button",name=re.compile(r"[0-9]{2}[.][0-9]{2}[.]20[0-9]{2}[ ]*[-–][ ]*[0-9]{2}[.][0-9]{2}[.]20[0-9]{2}"))
             if target:
-                picker=page.get_by_role("button",name=re.compile(r"\d{2}\.\d{2}\.20\d{2}\s*[-–]\s*\d{2}\.\d{2}\.20\d{2}"))
-                picker.wait_for(state="visible",timeout=15000); picker.click()
+                picker.wait_for(state="visible",timeout=20000)
+                picker.click(force=True,timeout=10000)
                 label=f"{target.day} {month_abbr[target.strftime('%m')]} {target.year}"
-                target_button=page.get_by_role("button",name=re.compile(rf"^0?{target.day}\s+{month_abbr[target.strftime('%m')]}\s+{target.year}$",re.I))
+                target_button=page.get_by_role("button",name=re.compile(rf"^0?{target.day}[ ]+{month_abbr[target.strftime('%m')]}[ ]+{target.year}$",re.I))
                 for _ in range(12):
                     if target_button.count() and target_button.first.is_visible(): break
                     nxt=page.get_by_role("button",name="Następna",exact=True)
                     if not nxt.count() or not nxt.is_visible(): break
-                    nxt.click(); page.wait_for_timeout(150)
+                    nxt.click(force=True,timeout=5000); page.wait_for_timeout(150)
                 if not target_button.count() or not target_button.first.is_visible(): raise ValueError(f"Rainbow nie udostępniło terminu {label}.")
-                target_button.first.click(); page.locator('[id-dti="loader"]').wait_for(state="hidden",timeout=30000)
-            flight=page.get_by_role("button",name=re.compile(r"wylot\s+\d{1,2}:\d{2}",re.I)).first
-            flight.wait_for(state="visible",timeout=15000); flight.click()
+                target_button.first.click(force=True,timeout=10000)
+                dismiss_rainbow_cookie_overlay(page)
+            flight=page.get_by_role("button",name=re.compile(r"wylot[ ]+[0-9]{1,2}:[0-9]{2}",re.I)).first
+            flight.wait_for(state="visible",timeout=20000)
+            flight.click(force=True,timeout=10000)
             choose=page.get_by_role("button",name=re.compile(r"WYBIERZ",re.I))
             choose.first.wait_for(state="visible",timeout=20000)
             page.wait_for_timeout(500)
@@ -411,7 +419,7 @@ def rainbow_airport_variants(url, departure_date=None, selected_code=None):
                     if match and rainbow_airport_key(match.group(0).strip())==selected_code:
                         target_index=card["i"]; break
                 if target_index is None: raise ValueError("To lotnisko nie jest dostępne dla wybranego terminu Rainbow.")
-                choose.nth(target_index).click(); page.locator('[id-dti="loader"]').wait_for(state="hidden",timeout=30000)
+                choose.nth(target_index).click(force=True,timeout=10000)
                 return {"url":page.url,"airports":airports}
             return {"url":safe_url,"airports":airports}
         finally:
