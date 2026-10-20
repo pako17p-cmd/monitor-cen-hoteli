@@ -208,14 +208,14 @@ def fetch_rainbow_offer(url, people_count=2):
             collect_visible_calendar_prices()
             target_month=rainbow_calendar_target()
             for _ in range(4):
-                if page.get_by_text(target_month,exact=True).count():
+                if page.get_by_text(re.compile(r"^"+re.escape(target_month)+r"$",re.I)).count():
                     break
                 next_button=page.get_by_role("button",name="Następna",exact=True)
                 if not next_button.count() or not next_button.is_visible():
                     break
                 next_button.click()
                 collect_visible_calendar_prices()
-            if not page.get_by_text(target_month,exact=True).count():
+            if not page.get_by_text(re.compile(r"^"+re.escape(target_month)+r"$",re.I)).count():
                 raise ValueError(f"Rainbow nie otworzyło kalendarza do miesiąca {target_month}.")
             collect_visible_calendar_prices()
             calendar_prices=list(seen.items())
