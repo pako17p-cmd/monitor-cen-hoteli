@@ -308,7 +308,7 @@ def itaka_airport_options(url):
             items=page.locator('input[type="checkbox"]').evaluate_all("""els=>els.map(e=>({value:(e.value||'').toUpperCase(),disabled:e.disabled,label:[...(e.labels||[])].map(x=>x.innerText||'').join(' ')+' '+(e.parentElement?.innerText||'')}))""")
             for item in items:
                 if item["disabled"]: continue
-                label=re.sub(r"\\s+"," ",item["label"]).strip()
+                label=re.sub(r"\s+"," ",item["label"]).strip()
                 code=item["value"] if item["value"] in AIRPORT_NAMES else None
                 if not code:
                     code=next((c for name,c in code_by_label.items() if name in label.casefold()),None)
@@ -365,14 +365,14 @@ def rainbow_airport_variants(url, departure_date=None, selected_code=None):
                     nxt.click(); page.wait_for_timeout(150)
                 if not target_button.count() or not target_button.first.is_visible(): raise ValueError(f"Rainbow nie udostępniło terminu {label}.")
                 target_button.first.click(); page.locator('[id-dti="loader"]').wait_for(state="hidden",timeout=30000)
-            flight=page.get_by_role("button",name=re.compile(r"wylot\\s+\\d{1,2}:\\d{2}",re.I)).first
+            flight=page.get_by_role("button",name=re.compile(r"wylot\s+\d{1,2}:\d{2}",re.I)).first
             flight.wait_for(state="visible",timeout=15000); flight.click()
             choose=page.get_by_role("button",name=re.compile(r"WYBIERZ",re.I))
             choose.first.wait_for(state="visible",timeout=20000)
             page.wait_for_timeout(500)
             cards=choose.evaluate_all("""buttons=>buttons.map((b,i)=>{let n=b,texts=[];for(let j=0;j<12&&n;j++,n=n.parentElement)texts.push(n.innerText||'');return {i,texts}})""")
             airports=[]
-            airport_re=re.compile(r"Warszawa(?:\\s*(?:-|–)?\\s*(?:Chopin|Modlin))?|Poznań|Katowice|Wrocław|Gdańsk|Kraków|Rzeszów|Łódź|Szczecin|Bydgoszcz",re.I)
+            airport_re=re.compile(r"Warszawa(?:\s*(?:-|–)?\s*(?:Chopin|Modlin))?|Poznań|Katowice|Wrocław|Gdańsk|Kraków|Rzeszów|Łódź|Szczecin|Bydgoszcz",re.I)
             for card in cards:
                 match=next((m for t in card["texts"] if (m:=airport_re.search(t))),None)
                 if not match: continue
