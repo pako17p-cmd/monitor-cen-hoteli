@@ -1,4 +1,4 @@
-import json, os, re, sqlite3, threading, time
+import base64, json, os, re, sqlite3, threading, time
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
@@ -6,7 +6,7 @@ from functools import wraps
 from flask import Flask, request, jsonify, session, redirect, render_template_string, send_from_directory
 from werkzeug.middleware.proxy_fix import ProxyFix
 import urllib.request
-from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 import github_state
 
 app = Flask(__name__)
@@ -298,14 +298,16 @@ def itaka_airport_options(url):
         try:
             page=browser.new_page(locale="pl-PL",timezone_id="Europe/Warsaw")
             # Don't wait for ITAKA analytics and tracking requests to finish.
-            page.goto(url,wait_until="commit",timeout=20000)
-            page.locator("body").wait_for(state="visible",timeout=15000)
-            page.wait_for_timeout(1200)
+            page.goto(url,wait_until="domcontentloaded",timeout=30000)
+            # Wait for the flight control when available, but don't let an unhydrated body
+            # locator block airport detection for 15 seconds on every hotel.
             control=page.get_by_text(re.compile(r"Skąd i jak",re.I)).first
+            try: control.wait_for(state="visible",timeout=8000)
+            except Exception: pass
             if control.count() and control.is_visible():
                 try: control.click(timeout=5000)
                 except Exception: pass
-            page.wait_for_timeout(400)
+            page.wait_for_timeout(700)
             items=page.locator('input[type="checkbox"]').evaluate_all("""els=>els.map(e=>({value:(e.value||'').toUpperCase(),disabled:e.disabled,label:[...(e.labels||[])].map(x=>x.innerText||'').join(' ')+' '+(e.parentElement?.innerText||'')}))""")
             for item in items:
                 if item["disabled"]: continue
@@ -371,11 +373,14 @@ def rainbow_airport_variants(url, departure_date=None, selected_code=None):
             choose=page.get_by_role("button",name=re.compile(r"WYBIERZ",re.I))
             choose.first.wait_for(state="visible",timeout=20000)
             page.wait_for_timeout(500)
-            cards=choose.evaluate_all("""buttons=>buttons.map((b,i)=>{let n=b,texts=[];for(let j=0;j<12&&n;j++,n=n.parentElement)texts.push(n.innerText||'');return {i,texts}})""")
+            # Read each alternate from its nearest card that contains exactly one
+            # WYBIERZ button. Broad ancestors also contain sibling flights and used to
+            # make every choice look like the currently selected airport.
+            cards=choose.evaluate_all("""buttons=>buttons.map((b,i)=>{let n=b,card='';for(let j=0;j<12&&n;j++,n=n.parentElement){const text=n.innerText||'';const count=[...n.querySelectorAll('button')].filter(x=>/^\\s*WYBIERZ\\s*$/i.test((x.innerText||x.textContent||'').trim())).length;if(count===1){card=text;break}}return {i,text:card||b.parentElement?.innerText||''}})""")
             airports=[]
             airport_re=re.compile(r"Warszawa(?:\s*(?:-|–)?\s*(?:Chopin|Modlin))?|Poznań|Katowice|Wrocław|Gdańsk|Kraków|Rzeszów|Łódź|Szczecin|Bydgoszcz",re.I)
             for card in cards:
-                match=next((m for t in card["texts"] if (m:=airport_re.search(t))),None)
+                match=airport_re.search(card["text"])
                 if not match: continue
                 name=match.group(0).strip()
                 code=rainbow_airport_key(name)
@@ -383,7 +388,7 @@ def rainbow_airport_variants(url, departure_date=None, selected_code=None):
             if selected_code:
                 target_index=None
                 for card in cards:
-                    match=next((m for t in card["texts"] if (m:=airport_re.search(t))),None)
+                    match=airport_re.search(card["text"])
                     if match and rainbow_airport_key(match.group(0).strip())==selected_code:
                         target_index=card["i"]; break
                 if target_index is None: raise ValueError("To lotnisko nie jest dostępne dla wybranego terminu Rainbow.")
@@ -439,9 +444,27 @@ def country_from_url(url):
 
 AIRPORT_NAMES={"WAW":"Warszawa-Okęcie","POZ":"Poznań","KTW":"Katowice","WRO":"Wrocław","GDN":"Gdańsk","KRK":"Kraków","RZE":"Rzeszów","LCJ":"Łódź","SZZ":"Szczecin","BZG":"Bydgoszcz"}
 def airport_code_from_url(url):
-    query=dict(parse_qsl(urlparse(url).query,keep_blank_values=True))
-    code=(query.get("airports") or "").upper()
-    if code in AIRPORT_NAMES: return code,AIRPORT_NAMES[code]
+    query=parse_qsl(urlparse(url).query,keep_blank_values=True)
+    direct=next((value.upper() for key,value in query if key.lower()=="airports"),"")
+    if direct in AIRPORT_NAMES: return direct,AIRPORT_NAMES[direct]
+    # ITAKA embeds the selected departure airport in its base64-encoded id[0] offer key.
+    # Decode it before falling back to the generic label so existing seeded offers also
+    # display their airport when the page/API cannot be inspected.
+    for key,value in query:
+        if not key.lower().startswith("id") or not value: continue
+        candidates=[value]
+        try: candidates.append(unquote(value))
+        except Exception: pass
+        for candidate in candidates:
+            try:
+                token=candidate.strip()
+                token += "="*((4-len(token)%4)%4)
+                decoded=base64.urlsafe_b64decode(token.encode("ascii")).decode("latin1",errors="ignore").upper()
+            except Exception:
+                continue
+            for code in AIRPORT_NAMES:
+                if code in decoded:
+                    return code,AIRPORT_NAMES[code]
     return "DEFAULT","Lotnisko z oferty"
 
 def connect():
@@ -460,10 +483,13 @@ def connect():
     con.execute("UPDATE hotels SET country=COALESCE(country,'Kraj nieustalony'),airport_name=COALESCE(airport_name,'Lotnisko z oferty')")
     for row in con.execute("SELECT id,url,country,airport_code,airport_name FROM hotels").fetchall():
         inferred_country=country_from_url(row["url"])
+        inferred_code,inferred_name=airport_code_from_url(row["url"])
         inferred_airport=AIRPORT_NAMES.get(row["airport_code"])
         if inferred_country!="Kraj nieustalony" and row["country"] in (None,"","Kraj nieustalony"):
             con.execute("UPDATE hotels SET country=? WHERE id=?",(inferred_country,row["id"]))
-        if inferred_airport and row["airport_name"] in (None,"","Lotnisko z oferty"):
+        if inferred_code!="DEFAULT" and row["airport_code"] in (None,"","DEFAULT"):
+            con.execute("UPDATE hotels SET airport_code=?,airport_name=? WHERE id=?",(inferred_code,inferred_name,row["id"]))
+        elif inferred_airport and row["airport_name"] in (None,"","Lotnisko z oferty"):
             con.execute("UPDATE hotels SET airport_name=? WHERE id=?",(inferred_airport,row["id"]))
     con.execute("CREATE TABLE IF NOT EXISTS prices(id INTEGER PRIMARY KEY,hotel_id INTEGER NOT NULL,checked_at TEXT NOT NULL,price REAL NOT NULL,FOREIGN KEY(hotel_id) REFERENCES hotels(id) ON DELETE CASCADE)")
     price_columns={row[1] for row in con.execute("PRAGMA table_info(prices)").fetchall()}
@@ -578,7 +604,7 @@ function openAdd(){$('#modal').classList.add('show')}function closeAdd(){$('#mod
 async function addHotel(e){e.preventDefault();let f=new FormData(e.target);try{await api('hotels',{method:'POST',body:JSON.stringify({name:f.get('name'),url:f.get('url'),people_count:Number(f.get('people_count'))})});closeAdd();e.target.reset();await load();status('Hotel dodany')}catch(x){status(x.message,true)}}
 async function removeHotel(id){if(!confirm('Usunąć monitor razem z historią cen?'))return;try{await api(`hotels/${id}`,{method:'DELETE'});if(selected===id)selected=null;await load()}catch(e){status(e.message,true)}}
 async function checkNow(){let b=$('#check');b.disabled=true;status('Zlecam sprawdzenie w GitHub Actions…');try{let d=await api('check',{method:'POST'});status(d.message);setTimeout(load,20000)}catch(e){status(e.message,true)}finally{b.disabled=false}}
-async function loadAllAirportOptions(){for(const h of hotels){const date=h.provider==='rainbow'?(h.offers?.find(o=>o.status==='available')?.date||h.departure_date):null;await loadAirportOptions(h.id,date)}}
+async function loadAllAirportOptions(){const list=[...hotels];for(let i=0;i<list.length;i+=2){await Promise.allSettled(list.slice(i,i+2).map(h=>{const date=h.provider==='rainbow'?(h.offers?.find(o=>o.status==='available')?.date||h.departure_date):null;return loadAirportOptions(h.id,date)}))}}
 window.addEventListener('resize',drawChart);load().then(loadAllAirportOptions);setInterval(load,60000);
 </script></body></html>'''
 
