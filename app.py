@@ -207,16 +207,20 @@ def fetch_rainbow_offer(url, people_count=2):
                         seen[found[0]]=found[1]
             collect_visible_calendar_prices()
             target_month=rainbow_calendar_target()
+            target_year=re.search(r"(20\\d{2})$",target_month).group(1)
+            target_name=target_month.rsplit(" ",1)[0].casefold()
+            target_month_number=next((number for number,name in RAINBOW_MONTH_NAMES.items() if name.casefold()==target_name),None)
+            target_prefix=f"{target_year}-{target_month_number}-" if target_month_number else None
             for _ in range(4):
-                if page.get_by_text(re.compile(r"^"+re.escape(target_month)+r"$",re.I)).count():
+                if target_prefix and any(date.startswith(target_prefix) for date in seen):
                     break
                 next_button=page.get_by_role("button",name="Następna",exact=True)
                 if not next_button.count() or not next_button.is_visible():
                     break
                 next_button.click()
                 collect_visible_calendar_prices()
-            if not page.get_by_text(re.compile(r"^"+re.escape(target_month)+r"$",re.I)).count():
-                raise ValueError(f"Rainbow nie otworzyło kalendarza do miesiąca {target_month}.")
+            if target_prefix and not any(date.startswith(target_prefix) for date in seen):
+                app.logger.warning("Rainbow nie pokazało cen do miesiąca %s; zapisuję dostępne terminy",target_month)
             collect_visible_calendar_prices()
             calendar_prices=list(seen.items())
             if not calendar_prices:
