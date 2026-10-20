@@ -170,8 +170,22 @@ def fetch_rainbow_offer(url, people_count=2):
                     cookie_settings.click(timeout=10000)
             consent_overlay.wait_for(state="hidden",timeout=15000)
 
-            # Wait until the offer configurator has finished loading before clicking its controls.
+            # The consent prompt can appear asynchronously while the offer configurator loads.
+            # Check it again after the loader settles, before touching the date control.
             page.locator('[id-dti="loader"]').wait_for(state="hidden",timeout=30000)
+            consent_overlay=page.locator(".r-consent-bottom-notif__modal:visible")
+            for _ in range(3):
+                if not consent_overlay.count():
+                    break
+                save_settings=page.get_by_role("button",name=re.compile(r"ZAPISZ I WYJDŹ",re.I)).last
+                if save_settings.count() and save_settings.is_visible():
+                    save_settings.click(timeout=10000)
+                else:
+                    cookie_settings=page.get_by_role("button",name=re.compile(r"USTAWIENIA PLIKÓW COOKIE",re.I)).last
+                    if not cookie_settings.count() or not cookie_settings.is_visible():
+                        raise ValueError("Rainbow wyświetliło okno cookies, którego nie udało się zamknąć.")
+                    cookie_settings.click(timeout=10000)
+            consent_overlay.wait_for(state="hidden",timeout=15000)
             page_text=page.locator("body").inner_text(timeout=20000)
             image_url=None
             image=page.locator('meta[property="og:image"]')
