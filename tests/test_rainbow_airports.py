@@ -75,7 +75,7 @@ class RainbowAirportTests(unittest.TestCase):
 
     def test_panel_can_mount_after_the_control_is_clicked(self):
         self.page.set_content("""
-            <button id="open" onclick="setTimeout(() => {
+            <button id="open" onpointerdown="setTimeout(() => {
                 const panel=document.createElement('div');
                 panel.id='panel'; panel.textContent='Loty'; document.body.append(panel);
             }, 200)">Otwórz loty</button>
