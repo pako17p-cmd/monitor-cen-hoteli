@@ -49,3 +49,11 @@ jobs:
           HISTORY_BRANCH: price-history
         run: python check_prices.py
 
+      - name: Upload Rainbow failure screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rainbow-debug
+          path: ${{ runner.temp }}/rainbow-debug/
+          if-no-files-found: ignore
+          retention-days: 3
