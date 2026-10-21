@@ -355,79 +355,149 @@ def dismiss_rainbow_cookie_overlay(page):
         raise ValueError("Rainbow ponownie wyświetliło okno cookies.")
 
 
+RAINBOW_FLIGHT_CARD_SELECTOR='[data-test-id^="r-component:pojedyncze-polaczenie:container-"]'
+
+def read_rainbow_flight_cards(page):
+    """Read complete flight cards, including the selected flight and h6 date headings."""
+    return page.evaluate(r"""() => {
+        const selector='[data-test-id^="r-component:pojedyncze-polaczenie:container-"]';
+        const nodes=[...document.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"],'+selector)];
+        let heading='',i=0;
+        const result=[];
+        for (const node of nodes) {
+            const text=node.innerText||node.textContent||'';
+            if ((node.getAttribute('data-test-id')||'').startsWith('r-component:pojedyncze-polaczenie:container-')) {
+                const action=[...node.querySelectorAll('button')].find(button=>/^\s*(WYBIERZ|WYBRANY)\s*$/i.test(button.innerText||button.textContent||''));
+                result.push({i:i++,text,heading,selected:/^\s*WYBRANY\s*$/i.test(action?.innerText||action?.textContent||'')});
+            } else if (/\d{1,2}\s+[a-ząćęłńóśźż]+\s+20\d{2}\s*[-–]/i.test(text)) {
+                heading=text.trim();
+            }
+        }
+        return result;
+    }""")
+
+def rainbow_airports_from_cards(cards, departure_date):
+    """Keep only airports actually present under the requested departure date."""
+    found=[]
+    airport_re=re.compile(r"Warszawa(?:\s*(?:-|–)?\s*(?:Chopin|Modlin))?|Poznań|Katowice|Wrocław|Gdańsk|Kraków|Rzeszów|Łódź|Szczecin|Bydgoszcz",re.I)
+    for card in cards:
+        heading=re.search(r"(?<!\d)(\d{1,2})\s+([a-ząćęłńóśźż]+)\s+(20\d{2})",card.get("heading",""),re.I)
+        if not heading:
+            continue
+        month=PL_MONTHS.get(heading.group(2).lower())
+        if not month:
+            continue
+        try:
+            date=datetime.strptime(f"{heading.group(3)}-{month}-{int(heading.group(1)):02d}","%Y-%m-%d").date().isoformat()
+        except ValueError:
+            continue
+        if date!=departure_date:
+            continue
+        match=airport_re.search(card.get("text",""))
+        if not match:
+            continue
+        name=re.sub(r"\s+"," ",match.group(0)).strip()
+        code=rainbow_airport_key(name)
+        if not any(item["code"]==code for item in found):
+            found.append(dict(code=code,name=name,departure_date=date,i=card["i"],selected=card.get("selected",False)))
+    return found
+
+def open_rainbow_control(page, control, expected):
+    """Wait for hydrated controls and recheck late consent overlays before retrying."""
+    for attempt in range(3):
+        dismiss_rainbow_cookie_overlay(page)
+        control.wait_for(state="visible",timeout=20000)
+        # Use pointer events: Rainbow's date popover opens on pointerdown, while
+        # other controls use click handlers. Retrying also covers late hydration.
+        try:
+            control.click(timeout=7000)
+            expected.wait_for(state="visible",timeout=7000)
+            return
+        except Exception:
+            if attempt==2:
+                raise
+    raise ValueError("Rainbow nie otworzyło wybranego panelu.")
+
 def rainbow_airport_variants(url, departure_date=None, selected_code=None):
     """Inspect or select Rainbow flight alternatives for one specific departure date."""
     from playwright.sync_api import sync_playwright
-    from datetime import date as date_type
     safe_url=sanitize_rainbow_url(url)
-    month_abbr={"01":"sty","02":"lut","03":"mar","04":"kwi","05":"maj","06":"cze","07":"lip","08":"sie","09":"wrz","10":"paź","11":"lis","12":"gru"}
-    target=date_type.fromisoformat(departure_date) if departure_date else None
     with sync_playwright() as p:
         browser=p.chromium.launch(headless=True,args=["--no-sandbox"])
         try:
             page=browser.new_page(locale="pl-PL",timezone_id="Europe/Warsaw")
             page.goto(safe_url,wait_until="domcontentloaded",timeout=60000)
+            page.get_by_text(re.compile(r"Cena\s+razem",re.I)).first.wait_for(state="visible",timeout=30000)
             dismiss_rainbow_cookie_overlay(page)
-            # Rainbow's overlay may remain visible forever while date/flight controls are active.
-            # Wait for the needed controls instead of waiting for this unrelated full-screen loader.
-            picker=page.get_by_role("button",name=re.compile(r"[0-9]{2}[.][0-9]{2}[.]20[0-9]{2}[ ]*[-–][ ]*[0-9]{2}[.][0-9]{2}[.]20[0-9]{2}"))
-            if target:
-                picker.wait_for(state="visible",timeout=20000)
-                picker.click(force=True,timeout=10000)
-                label=f"{target.day} {month_abbr[target.strftime('%m')]} {target.year}"
+            try:
+                page.locator('[id-dti="loader"]').wait_for(state="hidden",timeout=10000)
+            except Exception:
+                pass
+            dismiss_rainbow_cookie_overlay(page)
+            range_pattern=re.compile(r"[0-9]{2}[.][0-9]{2}[.]20[0-9]{2}[ ]*[-–][ ]*[0-9]{2}[.][0-9]{2}[.]20[0-9]{2}")
+            picker=page.get_by_role("button",name=range_pattern).first
+            picker.wait_for(state="visible",timeout=20000)
+            current_match=re.search(r"\d{2}\.\d{2}\.20\d{2}",picker.inner_text())
+            current_date=datetime.strptime(current_match.group(0),"%d.%m.%Y").date().isoformat() if current_match else None
+            target=datetime.strptime(departure_date or current_date,"%Y-%m-%d").date()
+            requested_date=target.isoformat()
+            if current_date!=requested_date:
+                day_pattern=re.compile(r"\d{1,2}\s+[a-ząćęłńóśźż]+\s+20\d{2}",re.I)
+                open_rainbow_control(page,picker,page.get_by_role("button",name=day_pattern).first)
                 month_labels={"01":"(?:sty|stycznia)","02":"(?:lut|lutego)","03":"(?:mar|marca)","04":"(?:kwi|kwietnia)","05":"(?:maj|maja)","06":"(?:cze|czerwca)","07":"(?:lip|lipca)","08":"(?:sie|sierpnia)","09":"(?:wrz|września)","10":"(?:paź|paz|października)","11":"(?:lis|listopada)","12":"(?:gru|grudnia)"}
-                target_button=page.get_by_role("button",name=re.compile(rf"(?<![0-9])0?{target.day}[ ]+{month_labels[target.strftime('%m')]}[ ]+{target.year}",re.I))
+                target_button=page.get_by_role("button",name=re.compile(rf"(?<![0-9])0?{target.day}\s+{month_labels[target.strftime('%m')]}\s+{target.year}",re.I)).first
                 for _ in range(12):
-                    if target_button.count() and target_button.first.is_visible(): break
+                    if target_button.count() and target_button.is_visible():
+                        break
                     nxt=page.get_by_role("button",name="Następna",exact=True)
-                    if not nxt.count() or not nxt.is_visible(): break
-                    nxt.click(force=True,timeout=5000); page.wait_for_timeout(150)
-                if target_button.count() and target_button.first.is_visible():
-                    target_button.first.click(force=True,timeout=10000)
-                    dismiss_rainbow_cookie_overlay(page)
-                else:
-                    # Some Rainbow dates are present in flight alternatives, but are not exposed
-                    # as selectable calendar buttons. Read the date-specific cards below.
-                    app.logger.info("Rainbow date %s is missing from the calendar; checking flight alternatives",label)
-                    page.keyboard.press("Escape")
-            flight=page.get_by_role("button",name=re.compile(r"wylot[ ]+[0-9]{1,2}:[0-9]{2}",re.I)).first
+                    if not nxt.count() or not nxt.is_visible():
+                        break
+                    nxt.click(timeout=5000)
+                    try:
+                        target_button.wait_for(state="visible",timeout=1000)
+                    except Exception:
+                        pass
+                if not target_button.count() or not target_button.is_visible() or not target_button.is_enabled():
+                    raise ValueError(f"Rainbow nie udostępniło terminu {requested_date} w kalendarzu.")
+                target_button.click(timeout=10000)
+                # A day click only previews the trip. ZAPISZ applies the new date and offer key.
+                save=page.get_by_role("button",name=re.compile(r"^\s*ZAPISZ\s*$",re.I))
+                save.wait_for(state="visible",timeout=10000)
+                before_save=page.url
+                save.click(timeout=10000)
+                page.get_by_role("button",name=re.compile(r"^\s*"+re.escape(target.strftime("%d.%m.%Y"))+r"\s*[-–]")).first.wait_for(state="visible",timeout=30000)
+                page.wait_for_function("(previous)=>location.href!==previous",arg=before_save,timeout=30000)
+                dismiss_rainbow_cookie_overlay(page)
+            flight=page.get_by_role("button",name=re.compile(r"wylot\s+[0-9]{1,2}:[0-9]{2}",re.I)).first
             flight.wait_for(state="visible",timeout=20000)
-            flight.click(force=True,timeout=10000)
-            choose=page.get_by_role("button",name=re.compile(r"WYBIERZ",re.I))
-            choose.first.wait_for(state="visible",timeout=20000)
-            page.wait_for_timeout(500)
-            # Read each alternate from its nearest card, and attach its preceding
-            # date heading so options from other departure dates are excluded.
-            cards=choose.evaluate_all("""buttons=>{const heads=[...document.querySelectorAll('h1,h2,h3,h4,h5,[role="heading"]')];return buttons.map((b,i)=>{let n=b,card='';for(let j=0;j<12&&n;j++,n=n.parentElement){const text=n.innerText||'';const count=[...n.querySelectorAll('button')].filter(x=>/^\\s*WYBIERZ\\s*$/i.test((x.innerText||x.textContent||'').trim())).length;if(count===1){card=text;break}}const heading=heads.filter(h=>h.compareDocumentPosition(b)&Node.DOCUMENT_POSITION_FOLLOWING).map(h=>(h.innerText||h.textContent||'').trim()).reverse().find(t=>/\\d{1,2}\\s+(?:sty|lut|mar|kwi|maj|cze|lip|sie|wrz|paź|paz|lis|gru)\\s+20\\d{2}\\s*[-–]/i.test(t))||'';return {i,text:card||b.parentElement?.innerText||'',heading}})}""")
-            airports=[]
-            airport_re=re.compile(r"Warszawa(?:\s*(?:-|–)?\s*(?:Chopin|Modlin))?|Poznań|Katowice|Wrocław|Gdańsk|Kraków|Rzeszów|Łódź|Szczecin|Bydgoszcz",re.I)
-            date_heading_re=re.compile(r"(\d{1,2})\s+(sty|lut|mar|kwi|maj|cze|lip|sie|wrz|paź|paz|lis|gru)\s+(20\d{2})",re.I)
-            def is_for_selected_date(card):
-                if not target: return True
-                heading=date_heading_re.search(card.get("heading",""))
-                if not heading: return False
-                month=RAINBOW_MONTHS.get(heading.group(2).lower())
-                if not month: return False
-                try: return date_type.fromisoformat(f"{heading.group(3)}-{month}-{int(heading.group(1)):02d}")==target
-                except ValueError: return False
-            for card in cards:
-                if not is_for_selected_date(card): continue
-                match=airport_re.search(card["text"])
-                if not match: continue
-                name=match.group(0).strip()
-                code=rainbow_airport_key(name)
-                if not any(item["code"]==code for item in airports): airports.append({"code":code,"name":name,"departure_date":departure_date})
+            flight_cards=page.locator(RAINBOW_FLIGHT_CARD_SELECTOR)
+            open_rainbow_control(page,flight,flight_cards.first)
+            options=rainbow_airports_from_cards(read_rainbow_flight_cards(page),requested_date)
+            if not options:
+                raise ValueError(f"Rainbow nie pokazało kart lotów dla terminu {requested_date}.")
+            airports=[dict(code=item["code"],name=item["name"],departure_date=requested_date) for item in options]
             if selected_code:
-                target_index=None
-                for card in cards:
-                    if not is_for_selected_date(card): continue
-                    match=airport_re.search(card["text"])
-                    if match and rainbow_airport_key(match.group(0).strip())==selected_code:
-                        target_index=card["i"]; break
-                if target_index is None: raise ValueError("To lotnisko nie jest dostępne dla wybranego terminu Rainbow.")
-                choose.nth(target_index).click(force=True,timeout=10000)
-                return {"url":page.url,"airports":airports}
-            return {"url":safe_url,"airports":airports}
+                option=next((item for item in options if item["code"]==selected_code),None)
+                if option is None:
+                    raise ValueError("To lotnisko nie jest dostępne dla wybranego terminu Rainbow.")
+                if not option["selected"]:
+                    before_select=page.url
+                    flight_cards.nth(option["i"]).get_by_role("button",name=re.compile(r"^\s*WYBIERZ\s*$",re.I)).click(timeout=10000)
+                    page.wait_for_function("(previous)=>location.href!==previous",arg=before_select,timeout=30000)
+                    page.get_by_role("button",name=re.compile(r"^\s*"+re.escape(option["name"])+r"\s+wylot",re.I)).first.wait_for(state="visible",timeout=20000)
+            return {"url":sanitize_rainbow_url(page.url),"airports":airports}
+        except Exception:
+            if os.environ.get("GITHUB_ACTIONS")=="true":
+                debug_dir=Path(os.environ.get("RUNNER_TEMP",str(APP_DIR)))/"rainbow-debug"
+                debug_dir.mkdir(parents=True,exist_ok=True)
+                filename=re.sub(r"[^a-zA-Z0-9_-]","-",urlparse(safe_url).path.strip("/"))+"-"+str(departure_date or "selected")
+                try:
+                    page.screenshot(path=str(debug_dir/(filename+".png")),full_page=True)
+                    labels=page.get_by_role("button").evaluate_all("buttons=>buttons.filter(b=>b.offsetParent!==null).map(b=>b.getAttribute('aria-label')||b.innerText||b.textContent||'').slice(0,35)")
+                    app.logger.warning("Rainbow debug buttons for %s: %s",departure_date,labels)
+                except Exception:
+                    pass
+            raise
         finally:
             browser.close()
 
@@ -777,9 +847,6 @@ def refresh_airport_options():
                         if not is_rainbow_url(variant_url):
                             raise ValueError("Rainbow nie zwróciło poprawnego linku wybranego lotu.")
                         options.append(dict(code=candidate["code"],name=candidate["name"],url=variant_url))
-                    current_code=hotel["airport_code"]
-                    if current_code and current_code!="DEFAULT" and not any(item["code"]==current_code for item in options):
-                        options.insert(0,dict(code=current_code,name=hotel["airport_name"] or "Lotnisko z oferty",url=sanitize_rainbow_url(hotel["url"])))
                     if not options:
                         raise ValueError("Nie znaleziono lotnisk dla tego terminu.")
                     by_date[departure_date]=dict(updated_at=now.isoformat(),airports=options)
