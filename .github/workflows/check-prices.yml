@@ -34,11 +34,11 @@ jobs:
       - name: Install Chromium
         run: python -m playwright install chromium --only-shell
 
-      - name: Test Rainbow airport parsing
+      - name: Test airport scraping and interface
         env:
           DISABLE_SCHEDULER: "1"
           DB_PATH: ${{ runner.temp }}/hotel-regression.db
-        run: python -m unittest discover -s tests -p "test_rainbow_airports.py" -v
+        run: python -m unittest discover -s tests -p "test_*.py" -v
 
       - name: Read prices and save history
         env:
