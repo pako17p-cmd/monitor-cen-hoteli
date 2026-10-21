@@ -84,7 +84,7 @@ class RainbowConsentBrowserTests(unittest.TestCase):
         <div id="calendar" hidden><button aria-label="29 paź 2026, 3830,50">29 3830,50 zł</button></div>
         <script>document.querySelector('#picker').onpointerdown=()=>document.querySelector('#calendar').hidden=false;</script>
         """ + MODAL + "</body></html>"
-        self.page.route("https://r.pl/**",lambda route:route.fulfill(content_type="text/html",body=fixture))
+        self.page.route("https://r.pl/**",lambda route:route.fulfill(content_type="text/html; charset=utf-8",body=fixture))
         fake_browser=MagicMock()
         fake_browser.new_page.return_value=self.page
         fake_runtime=SimpleNamespace(chromium=SimpleNamespace(launch=lambda **kwargs:fake_browser))
