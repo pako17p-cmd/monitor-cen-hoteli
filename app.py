@@ -402,6 +402,22 @@ def rainbow_airports_from_cards(cards, departure_date):
             found.append(dict(code=code,name=name,departure_date=date,i=card["i"],selected=card.get("selected",False)))
     return found
 
+def open_rainbow_control(page, control, expected):
+    """Wait for hydrated controls and recheck late consent overlays before retrying."""
+    for attempt in range(3):
+        dismiss_rainbow_cookie_overlay(page)
+        control.wait_for(state="visible",timeout=20000)
+        # A stale visual loader can cover a working control. A DOM click invokes the
+        # intended button without discarding consent state or changing page styles.
+        control.evaluate("(button)=>button.click()")
+        try:
+            expected.wait_for(state="visible",timeout=7000)
+            return
+        except Exception:
+            if attempt==2:
+                raise
+    raise ValueError("Rainbow nie otworzyło wybranego panelu.")
+
 def rainbow_airport_variants(url, departure_date=None, selected_code=None):
     """Inspect or select Rainbow flight alternatives for one specific departure date."""
     from playwright.sync_api import sync_playwright
@@ -411,6 +427,12 @@ def rainbow_airport_variants(url, departure_date=None, selected_code=None):
         try:
             page=browser.new_page(locale="pl-PL",timezone_id="Europe/Warsaw")
             page.goto(safe_url,wait_until="domcontentloaded",timeout=60000)
+            page.get_by_text(re.compile(r"Cena\s+razem",re.I)).first.wait_for(state="visible",timeout=30000)
+            dismiss_rainbow_cookie_overlay(page)
+            try:
+                page.locator('[id-dti="loader"]').wait_for(state="hidden",timeout=10000)
+            except Exception:
+                pass
             dismiss_rainbow_cookie_overlay(page)
             range_pattern=re.compile(r"[0-9]{2}[.][0-9]{2}[.]20[0-9]{2}[ ]*[-–][ ]*[0-9]{2}[.][0-9]{2}[.]20[0-9]{2}")
             picker=page.get_by_role("button",name=range_pattern).first
@@ -420,11 +442,8 @@ def rainbow_airport_variants(url, departure_date=None, selected_code=None):
             target=datetime.strptime(departure_date or current_date,"%Y-%m-%d").date()
             requested_date=target.isoformat()
             if current_date!=requested_date:
-                picker.click(force=True,timeout=10000)
-                # The calendar mounts asynchronously. Do not inspect count() before its day
-                # controls exist, otherwise every valid date appears to be unavailable.
                 day_pattern=re.compile(r"\d{1,2}\s+[a-ząćęłńóśźż]+\s+20\d{2}",re.I)
-                page.get_by_role("button",name=day_pattern).first.wait_for(state="visible",timeout=20000)
+                open_rainbow_control(page,picker,page.get_by_role("button",name=day_pattern).first)
                 month_labels={"01":"(?:sty|stycznia)","02":"(?:lut|lutego)","03":"(?:mar|marca)","04":"(?:kwi|kwietnia)","05":"(?:maj|maja)","06":"(?:cze|czerwca)","07":"(?:lip|lipca)","08":"(?:sie|sierpnia)","09":"(?:wrz|września)","10":"(?:paź|paz|października)","11":"(?:lis|listopada)","12":"(?:gru|grudnia)"}
                 target_button=page.get_by_role("button",name=re.compile(rf"(?<![0-9])0?{target.day}\s+{month_labels[target.strftime('%m')]}\s+{target.year}",re.I)).first
                 for _ in range(12):
@@ -451,9 +470,8 @@ def rainbow_airport_variants(url, departure_date=None, selected_code=None):
                 dismiss_rainbow_cookie_overlay(page)
             flight=page.get_by_role("button",name=re.compile(r"wylot\s+[0-9]{1,2}:[0-9]{2}",re.I)).first
             flight.wait_for(state="visible",timeout=20000)
-            flight.click(force=True,timeout=10000)
             flight_cards=page.locator(RAINBOW_FLIGHT_CARD_SELECTOR)
-            flight_cards.first.wait_for(state="visible",timeout=20000)
+            open_rainbow_control(page,flight,flight_cards.first)
             options=rainbow_airports_from_cards(read_rainbow_flight_cards(page),requested_date)
             if not options:
                 raise ValueError(f"Rainbow nie pokazało kart lotów dla terminu {requested_date}.")
@@ -468,6 +486,18 @@ def rainbow_airport_variants(url, departure_date=None, selected_code=None):
                     page.wait_for_function("(previous)=>location.href!==previous",arg=before_select,timeout=30000)
                     page.get_by_role("button",name=re.compile(r"^\s*"+re.escape(option["name"])+r"\s+wylot",re.I)).first.wait_for(state="visible",timeout=20000)
             return {"url":sanitize_rainbow_url(page.url),"airports":airports}
+        except Exception:
+            if os.environ.get("GITHUB_ACTIONS")=="true":
+                debug_dir=Path(os.environ.get("RUNNER_TEMP",str(APP_DIR)))/"rainbow-debug"
+                debug_dir.mkdir(parents=True,exist_ok=True)
+                filename=re.sub(r"[^a-zA-Z0-9_-]","-",urlparse(safe_url).path.strip("/"))+"-"+str(departure_date or "selected")
+                try:
+                    page.screenshot(path=str(debug_dir/(filename+".png")),full_page=True)
+                    labels=page.get_by_role("button").evaluate_all("buttons=>buttons.filter(b=>b.offsetParent!==null).map(b=>b.getAttribute('aria-label')||b.innerText||b.textContent||'').slice(0,35)")
+                    app.logger.warning("Rainbow debug buttons for %s: %s",departure_date,labels)
+                except Exception:
+                    pass
+            raise
         finally:
             browser.close()
 
