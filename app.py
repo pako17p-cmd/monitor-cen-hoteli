@@ -407,10 +407,10 @@ def open_rainbow_control(page, control, expected):
     for attempt in range(3):
         dismiss_rainbow_cookie_overlay(page)
         control.wait_for(state="visible",timeout=20000)
-        # A stale visual loader can cover a working control. A DOM click invokes the
-        # intended button without discarding consent state or changing page styles.
-        control.evaluate("(button)=>button.click()")
+        # Use pointer events: Rainbow's date popover opens on pointerdown, while
+        # other controls use click handlers. Retrying also covers late hydration.
         try:
+            control.click(timeout=7000)
             expected.wait_for(state="visible",timeout=7000)
             return
         except Exception:
@@ -461,7 +461,7 @@ def rainbow_airport_variants(url, departure_date=None, selected_code=None):
                     raise ValueError(f"Rainbow nie udostępniło terminu {requested_date} w kalendarzu.")
                 target_button.click(timeout=10000)
                 # A day click only previews the trip. ZAPISZ applies the new date and offer key.
-                save=page.get_by_role("button",name="ZAPISZ",exact=True)
+                save=page.get_by_role("button",name=re.compile(r"^\s*ZAPISZ\s*$",re.I))
                 save.wait_for(state="visible",timeout=10000)
                 before_save=page.url
                 save.click(timeout=10000)
@@ -482,7 +482,7 @@ def rainbow_airport_variants(url, departure_date=None, selected_code=None):
                     raise ValueError("To lotnisko nie jest dostępne dla wybranego terminu Rainbow.")
                 if not option["selected"]:
                     before_select=page.url
-                    flight_cards.nth(option["i"]).get_by_role("button",name="WYBIERZ",exact=True).click(timeout=10000)
+                    flight_cards.nth(option["i"]).get_by_role("button",name=re.compile(r"^\s*WYBIERZ\s*$",re.I)).click(timeout=10000)
                     page.wait_for_function("(previous)=>location.href!==previous",arg=before_select,timeout=30000)
                     page.get_by_role("button",name=re.compile(r"^\s*"+re.escape(option["name"])+r"\s+wylot",re.I)).first.wait_for(state="visible",timeout=20000)
             return {"url":sanitize_rainbow_url(page.url),"airports":airports}
