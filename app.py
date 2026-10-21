@@ -170,6 +170,18 @@ def rainbow_calendar_target():
     return f"{RAINBOW_MONTH_NAMES[f'{month:02d}']} {year}"
 
 def fetch_rainbow_offer(url, people_count=2):
+    """Retry one transient browser/consent failure in a fresh context."""
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+    for attempt in range(2):
+        try:
+            return _fetch_rainbow_offer_once(url,people_count)
+        except (RainbowConsentError,PlaywrightTimeoutError) as exc:
+            if attempt==1:
+                raise
+            app.logger.warning("Retrying Rainbow price read in a fresh browser after: %s",exc)
+
+
+def _fetch_rainbow_offer_once(url, people_count=2):
     """Read the selected Rainbow offer and the visible departure-price calendar through the end of the second future month."""
     from playwright.sync_api import sync_playwright
     safe_url=sanitize_rainbow_url(url)
@@ -184,38 +196,10 @@ def fetch_rainbow_offer(url, people_count=2):
             except Exception:
                 page.locator("body").wait_for(state="visible",timeout=10000)
 
-            # Rainbow blocks the offer calendar with a consent dialog on a fresh browser.
-            # Keep optional cookies disabled: open settings and save the required-only defaults.
-            consent_overlay=page.locator(".r-consent-bottom-notif__modal:visible")
-            for _ in range(3):
-                if not consent_overlay.count():
-                    break
-                save_settings=page.get_by_role("button",name=re.compile(r"ZAPISZ I WYJDŹ",re.I)).last
-                if save_settings.count() and save_settings.is_visible():
-                    save_settings.click(timeout=10000)
-                else:
-                    cookie_settings=page.get_by_role("button",name=re.compile(r"USTAWIENIA PLIKÓW COOKIE",re.I)).last
-                    if not cookie_settings.count() or not cookie_settings.is_visible():
-                        raise ValueError("Rainbow wyświetliło okno cookies, którego nie udało się zamknąć.")
-                    cookie_settings.click(timeout=10000)
-            consent_overlay.wait_for(state="hidden",timeout=15000)
-
-            # The consent prompt can appear asynchronously while the offer configurator loads.
-            # Check it again after the loader settles, before touching the date control.
+            dismiss_rainbow_cookie_overlay(page)
+            # A second consent prompt can mount while the configurator loads.
             page.locator('[id-dti="loader"]').wait_for(state="hidden",timeout=30000)
-            consent_overlay=page.locator(".r-consent-bottom-notif__modal:visible")
-            for _ in range(3):
-                if not consent_overlay.count():
-                    break
-                save_settings=page.get_by_role("button",name=re.compile(r"ZAPISZ I WYJDŹ",re.I)).last
-                if save_settings.count() and save_settings.is_visible():
-                    save_settings.click(timeout=10000)
-                else:
-                    cookie_settings=page.get_by_role("button",name=re.compile(r"USTAWIENIA PLIKÓW COOKIE",re.I)).last
-                    if not cookie_settings.count() or not cookie_settings.is_visible():
-                        raise ValueError("Rainbow wyświetliło okno cookies, którego nie udało się zamknąć.")
-                    cookie_settings.click(timeout=10000)
-            consent_overlay.wait_for(state="hidden",timeout=15000)
+            dismiss_rainbow_cookie_overlay(page)
             page_text=page.locator("body").inner_text(timeout=20000)
             image_url=None
             image=page.locator('meta[property="og:image"]')
@@ -223,10 +207,8 @@ def fetch_rainbow_offer(url, people_count=2):
                 image_url=image.first.get_attribute("content")
 
             date_picker=page.get_by_role("button",name=re.compile(r"\d{2}\.\d{2}\.20\d{2}\s*[-–]\s*\d{2}\.\d{2}\.20\d{2}"))
-            date_picker.wait_for(state="visible",timeout=15000)
-            date_picker.click()
             day_button=page.get_by_role("button",name=re.compile(r"\d{1,2}\s+(?:sty|lut|mar|kwi|maj|cze|lip|sie|wrz|paź|paz|lis|gru)\s+20\d{2}",re.I))
-            day_button.first.wait_for(state="visible",timeout=15000)
+            open_rainbow_control(page,date_picker,day_button.first)
             seen={}
             def collect_visible_calendar_prices():
                 buttons=page.get_by_role("button").evaluate_all("""buttons => buttons.map(b => ({label:b.getAttribute('aria-label')||b.getAttribute('title')||'', text:b.innerText||b.textContent||''}))""")
@@ -256,6 +238,9 @@ def fetch_rainbow_offer(url, people_count=2):
                 samples=page.get_by_role("button").evaluate_all("""buttons => buttons.filter(b => /20\\d{2}/.test((b.getAttribute('aria-label')||'')+' '+(b.getAttribute('title')||'')+' '+(b.innerText||b.textContent||''))).slice(0,20).map(b => ({label:b.getAttribute('aria-label')||b.getAttribute('title')||'', text:b.innerText||b.textContent||''}))""")
                 app.logger.warning("Rainbow calendar sample buttons: %s",samples)
                 raise ValueError("Rainbow nie udostępniło cen w kalendarzu wyjazdów.")
+        except Exception:
+            save_rainbow_failure_debug(page,safe_url,"prices")
+            raise
         finally:
             browser.close()
     text=re.sub(r"\s+"," ",page_text).replace("\u00a0"," ")
@@ -323,36 +308,54 @@ def itaka_airport_options(url):
         found.insert(0,{"code":current_code,"name":current_name})
     return found or [{"code":current_code,"name":current_name}]
 
-def dismiss_rainbow_cookie_overlay(page):
-    """Save the current necessary-only cookie choice, including delayed overlays."""
+class RainbowConsentError(ValueError):
+    """The real cookie controls did not become usable within the bounded retries."""
+
+
+def dismiss_rainbow_cookie_overlay(page, timeout_ms=10000):
+    """Wait for consent controls to mount and save necessary-only settings."""
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
     overlay=page.locator(".r-consent-bottom-notif__modal:visible")
-    for _ in range(3):
-        if not overlay.count(): return
-        save=page.get_by_role("button",name=re.compile(r"ZAPISZ I WYJDŹ",re.I)).last
+    # Filter hidden duplicates before waiting/clicking: the modal shell can mount
+    # before its buttons, and the settings panel replaces the initial buttons.
+    visible_buttons=page.locator("button:visible")
+    settings=visible_buttons.filter(has_text=re.compile(r"^\s*USTAWIENIA PLIKÓW COOKIE\s*$",re.I)).last
+    save=visible_buttons.filter(has_text=re.compile(r"^\s*ZAPISZ I WYJDŹ\s*$",re.I)).last
+    for attempt in range(3):
+        if not overlay.count():
+            return
         try:
-            save.wait_for(state="visible",timeout=2500)
-        except Exception:
-            settings=page.get_by_role("button",name=re.compile(r"USTAWIENIA PLIKÓW COOKIE",re.I)).last
-            try:
-                settings.wait_for(state="visible",timeout=5000)
-                settings.click(timeout=10000)
-                save.wait_for(state="visible",timeout=8000)
-            except Exception as e:
-                labels=page.locator("button").evaluate_all("""els=>els.filter(b=>b.offsetParent!==null).map(b=>(b.innerText||b.textContent||'').trim()).filter(Boolean).slice(0,20)""")
-                # Rainbow sometimes leaves a stale consent overlay in the DOM without its
-                # controls, although the actual date or flight control is already usable.
-                flight_control=page.get_by_role("button",name=re.compile(r"wylot[ ]+[0-9]{1,2}:[0-9]{2}",re.I)).first
-                date_control=page.get_by_role("button",name=re.compile(r"[0-9]{2}[.][0-9]{2}[.]20[0-9]{2}[ ]*[-–][ ]*[0-9]{2}[.][0-9]{2}[.]20[0-9]{2}"))
-                if (flight_control.count() and flight_control.is_visible()) or (date_control.count() and date_control.is_visible()):
-                    app.logger.warning("Rainbow consent overlay has no controls; continuing because offer controls are visible: %s",labels)
-                    return
-                app.logger.warning("Rainbow consent controls not ready; visible buttons: %s",labels)
-                raise ValueError("Rainbow wyświetliło okno cookies, ale nie załadowało jego przycisków.") from e
-        save.click(timeout=10000)
-        try: overlay.wait_for(state="hidden",timeout=10000)
-        except Exception: page.wait_for_timeout(500)
-    if overlay.count():
-        raise ValueError("Rainbow ponownie wyświetliło okno cookies.")
+            settings.or_(save).first.wait_for(state="visible",timeout=timeout_ms)
+            if save.count():
+                save.click(timeout=timeout_ms)
+                overlay.wait_for(state="hidden",timeout=timeout_ms)
+            else:
+                settings.click(timeout=timeout_ms)
+                save.wait_for(state="visible",timeout=timeout_ms)
+                save.click(timeout=timeout_ms)
+                overlay.wait_for(state="hidden",timeout=timeout_ms)
+            return
+        except PlaywrightTimeoutError:
+            if not overlay.count():
+                return
+            app.logger.warning("Rainbow cookie controls not ready; retry %s/3",attempt+1)
+    # Visible offer controls do not prove a modal is gone; keep the failure explicit.
+    raise RainbowConsentError("Rainbow nie zakończyło ładowania lub zapisu ustawień cookies.")
+
+
+def save_rainbow_failure_debug(page, url, context):
+    """Retain a screenshot and visible control labels for failures in Actions."""
+    if os.environ.get("GITHUB_ACTIONS")!="true":
+        return
+    debug_dir=Path(os.environ.get("RUNNER_TEMP",str(APP_DIR)))/"rainbow-debug"
+    try:
+        debug_dir.mkdir(parents=True,exist_ok=True)
+        filename=re.sub(r"[^a-zA-Z0-9_-]","-",urlparse(url).path.strip("/"))+"-"+context+"-"+str(time.time_ns())
+        page.screenshot(path=str(debug_dir/(filename+".png")),full_page=True)
+        labels=page.get_by_role("button").evaluate_all("buttons=>buttons.filter(b=>b.offsetParent!==null).map(b=>b.getAttribute('aria-label')||b.innerText||b.textContent||'').slice(0,35)")
+        app.logger.warning("Rainbow debug buttons (%s): %s",context,labels)
+    except Exception:
+        app.logger.warning("Could not save Rainbow failure diagnostics",exc_info=True)
 
 
 RAINBOW_FLIGHT_CARD_SELECTOR='[data-test-id^="r-component:pojedyncze-polaczenie:container-"]'
@@ -487,16 +490,7 @@ def rainbow_airport_variants(url, departure_date=None, selected_code=None):
                     page.get_by_role("button",name=re.compile(r"^\s*"+re.escape(option["name"])+r"\s+wylot",re.I)).first.wait_for(state="visible",timeout=20000)
             return {"url":sanitize_rainbow_url(page.url),"airports":airports}
         except Exception:
-            if os.environ.get("GITHUB_ACTIONS")=="true":
-                debug_dir=Path(os.environ.get("RUNNER_TEMP",str(APP_DIR)))/"rainbow-debug"
-                debug_dir.mkdir(parents=True,exist_ok=True)
-                filename=re.sub(r"[^a-zA-Z0-9_-]","-",urlparse(safe_url).path.strip("/"))+"-"+str(departure_date or "selected")
-                try:
-                    page.screenshot(path=str(debug_dir/(filename+".png")),full_page=True)
-                    labels=page.get_by_role("button").evaluate_all("buttons=>buttons.filter(b=>b.offsetParent!==null).map(b=>b.getAttribute('aria-label')||b.innerText||b.textContent||'').slice(0,35)")
-                    app.logger.warning("Rainbow debug buttons for %s: %s",departure_date,labels)
-                except Exception:
-                    pass
+            save_rainbow_failure_debug(page,safe_url,str(departure_date or "airports"))
             raise
         finally:
             browser.close()
