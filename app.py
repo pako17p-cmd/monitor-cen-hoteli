@@ -382,9 +382,14 @@ def rainbow_airport_variants(url, departure_date=None, selected_code=None):
                     nxt=page.get_by_role("button",name="Następna",exact=True)
                     if not nxt.count() or not nxt.is_visible(): break
                     nxt.click(force=True,timeout=5000); page.wait_for_timeout(150)
-                if not target_button.count() or not target_button.first.is_visible(): raise ValueError(f"Rainbow nie udostępniło terminu {label}.")
-                target_button.first.click(force=True,timeout=10000)
-                dismiss_rainbow_cookie_overlay(page)
+                if target_button.count() and target_button.first.is_visible():
+                    target_button.first.click(force=True,timeout=10000)
+                    dismiss_rainbow_cookie_overlay(page)
+                else:
+                    # Some Rainbow dates are present in flight alternatives, but are not exposed
+                    # as selectable calendar buttons. Read the date-specific cards below.
+                    app.logger.info("Rainbow date %s is missing from the calendar; checking flight alternatives",label)
+                    page.keyboard.press("Escape")
             flight=page.get_by_role("button",name=re.compile(r"wylot[ ]+[0-9]{1,2}:[0-9]{2}",re.I)).first
             flight.wait_for(state="visible",timeout=20000)
             flight.click(force=True,timeout=10000)
