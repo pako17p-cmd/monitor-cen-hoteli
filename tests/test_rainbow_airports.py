@@ -1,7 +1,7 @@
 """Regression tests for Rainbow's flight drawer, without requesting external pages."""
 import unittest
 from playwright.sync_api import sync_playwright
-from app import read_rainbow_flight_cards, rainbow_airports_from_cards
+from app import read_rainbow_flight_cards, rainbow_airports_from_cards, open_rainbow_control
 
 FIXTURE = """
 <h4>Unrelated hotel heading</h4>
@@ -72,6 +72,16 @@ class RainbowAirportTests(unittest.TestCase):
         options=rainbow_airports_from_cards(read_rainbow_flight_cards(self.page),"2026-11-05")
         self.assertEqual(len(options),1)
         self.assertEqual(options[0]["code"],"R-KATOWICE")
+
+    def test_panel_can_mount_after_the_control_is_clicked(self):
+        self.page.set_content("""
+            <button id="open" onclick="setTimeout(() => {
+                const panel=document.createElement('div');
+                panel.id='panel'; panel.textContent='Loty'; document.body.append(panel);
+            }, 200)">Otwórz loty</button>
+        """)
+        open_rainbow_control(self.page,self.page.locator("#open"),self.page.locator("#panel"))
+        self.assertTrue(self.page.locator("#panel").is_visible())
 
     def test_duplicate_airports_and_invalid_dates_do_not_create_options(self):
         cards=[
