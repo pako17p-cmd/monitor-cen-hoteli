@@ -371,7 +371,6 @@ def rainbow_airport_variants(url, departure_date=None, selected_code=None):
             # Rainbow's overlay may remain visible forever while date/flight controls are active.
             # Wait for the needed controls instead of waiting for this unrelated full-screen loader.
             picker=page.get_by_role("button",name=re.compile(r"[0-9]{2}[.][0-9]{2}[.]20[0-9]{2}[ ]*[-–][ ]*[0-9]{2}[.][0-9]{2}[.]20[0-9]{2}"))
-            calendar_date_selected=False
             if target:
                 picker.wait_for(state="visible",timeout=20000)
                 picker.click(force=True,timeout=10000)
@@ -385,7 +384,6 @@ def rainbow_airport_variants(url, departure_date=None, selected_code=None):
                     nxt.click(force=True,timeout=5000); page.wait_for_timeout(150)
                 if target_button.count() and target_button.first.is_visible():
                     target_button.first.click(force=True,timeout=10000)
-                    calendar_date_selected=True
                     dismiss_rainbow_cookie_overlay(page)
                 else:
                     # Some Rainbow dates are present in flight alternatives, but are not exposed
