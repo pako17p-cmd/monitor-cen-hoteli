@@ -985,12 +985,27 @@ def check_itaka_hotel(hotel, max_departure):
     c=connect()
     try:
         cached=_decode_airport_options(c.execute("SELECT airport_options FROM hotels WHERE id=?",(hotel['id'],)).fetchone()[0])
-        if not isinstance(cached,dict) or cached.get('version')!=2:
-            # Previous calendar reads mixed departure airports. Retain those observations
-            # as unverified history instead of attaching them to an invented flight.
-            c.execute("UPDATE prices SET airport_code='LEGACY-ITAKA' WHERE hotel_id=?",(hotel['id'],))
-            c.execute("INSERT OR IGNORE INTO tracked_departures_by_airport(hotel_id,airport_code,departure_date,last_seen_at,missing_checks,status,current_price,previous_price) SELECT hotel_id,'LEGACY-ITAKA',departure_date,last_seen_at,missing_checks,'unavailable',current_price,previous_price FROM tracked_departures_by_airport WHERE hotel_id=?",(hotel['id'],))
-            c.execute("DELETE FROM tracked_departures_by_airport WHERE hotel_id=? AND airport_code!='LEGACY-ITAKA'",(hotel['id'],))
+        if not isinstance(cached,dict): cached={}
+        prior_by_date={}
+        if cached.get('version')!=2:
+            # Retain verified legacy airports, and quarantine only misattributed records.
+            trusted={a['code']:a for a in cached.get('airports',[]) if a.get('code')}
+            old_records=c.execute("SELECT departure_date,airport_code FROM tracked_departures_by_airport WHERE hotel_id=?",(hotel['id'],)).fetchall()
+            for row in old_records:
+                code=row['airport_code']
+                if code in trusted:
+                    prior_by_date.setdefault(row['departure_date'],dict(airports=[]))['airports'].append(trusted[code])
+            untrusted={r['airport_code'] for r in old_records}-set(trusted)-{'LEGACY-ITAKA'}
+            for code in untrusted:
+                c.execute("UPDATE prices SET airport_code='LEGACY-ITAKA' WHERE hotel_id=? AND airport_code=?",(hotel['id'],code))
+                c.execute("INSERT OR IGNORE INTO tracked_departures_by_airport(hotel_id,airport_code,departure_date,last_seen_at,missing_checks,status,current_price,previous_price) SELECT hotel_id,'LEGACY-ITAKA',departure_date,last_seen_at,missing_checks,'unavailable',current_price,previous_price FROM tracked_departures_by_airport WHERE hotel_id=? AND airport_code=?",(hotel['id'],code))
+                c.execute("DELETE FROM tracked_departures_by_airport WHERE hotel_id=? AND airport_code=?",(hotel['id'],code))
+        known_by_date={}
+        for source in [prior_by_date,cached.get('known_by_date',{}),cached.get('by_date',{}),by_date]:
+            for date,entry in source.items():
+                previous=known_by_date.get(date,{}).get('airports',[])
+                options=list({a['code']:a for a in previous+entry.get('airports',[]) if a.get('code')}.values())
+                known_by_date[date]=dict(updated_at=stamp,airports=options)
         for v in variants:
             previous=c.execute("SELECT price,per_person FROM prices WHERE hotel_id=? AND airport_code=? AND departure_date=? ORDER BY id DESC LIMIT 1",(hotel['id'],v['code'],v['date'])).fetchone()
             old=(previous['price'] if previous['per_person'] else previous['price']/hotel['people_count']) if previous else None
@@ -1000,11 +1015,11 @@ def check_itaka_hotel(hotel, max_departure):
         seen={(v['date'],v['code']) for v in variants}
         for old in c.execute("SELECT departure_date,airport_code FROM tracked_departures_by_airport WHERE hotel_id=? AND departure_date>=date('now') AND departure_date<=? AND airport_code!='LEGACY-ITAKA'",(hotel['id'],max_departure)).fetchall():
             if (old['departure_date'],old['airport_code']) not in seen:
-                c.execute("UPDATE tracked_departures_by_airport SET missing_checks=missing_checks+1,status=CASE WHEN missing_checks+1>=2 THEN 'unavailable' ELSE status END WHERE hotel_id=? AND departure_date=? AND airport_code=?",(hotel['id'],old['departure_date'],old['airport_code']))
+                c.execute("UPDATE tracked_departures_by_airport SET missing_checks=missing_checks+1,status='unavailable' WHERE hotel_id=? AND departure_date=? AND airport_code=?",(hotel['id'],old['departure_date'],old['airport_code']))
         original=airport_code_from_url(hotel['url'])[0]
         selected=next((v for v in variants if v['code']==original),variants[0])
         airports=list({v['code']:dict(code=v['code'],name=v['name']) for v in variants}.values())
-        payload=dict(version=2,updated_at=stamp,airports=airports,by_date=by_date)
+        payload=dict(version=2,updated_at=stamp,airports=airports,by_date=by_date,known_by_date=known_by_date)
         extractor=Extractor();extractor.feed(html)
         c.execute("UPDATE hotels SET airport_code=?,airport_name=?,airport_options=?,country=?,image_url=COALESCE(?,image_url),last_checked_at=? WHERE id=?",(selected['code'],selected['name'],json.dumps(payload,ensure_ascii=False),country_from_url(hotel['url']),extractor.image_url,stamp,hotel['id']))
         c.commit()
@@ -1050,7 +1065,7 @@ def run_checks():
                 known=c.execute("SELECT departure_date FROM tracked_departures_by_airport WHERE hotel_id=? AND airport_code=? AND departure_date>=date('now') AND departure_date<=?",(h['id'],airport_code,max_departure)).fetchall()
                 for record in known:
                     if record['departure_date'] not in seen_dates:
-                        c.execute("UPDATE tracked_departures_by_airport SET missing_checks=missing_checks+1,status=CASE WHEN missing_checks+1>=2 THEN 'unavailable' ELSE status END WHERE hotel_id=? AND airport_code=? AND departure_date=?",(h['id'],airport_code,record['departure_date']))
+                        c.execute("UPDATE tracked_departures_by_airport SET missing_checks=missing_checks+1,status='unavailable' WHERE hotel_id=? AND airport_code=? AND departure_date=?",(h['id'],airport_code,record['departure_date']))
             c.execute("UPDATE hotels SET image_url=COALESCE(?,image_url),last_checked_at=?,country=?,airport_code=?,airport_name=? WHERE id=?",(image_url,stamp,country_from_url(h['url']),airport_code,airport_name,h['id']))
             c.commit(); c.close()
         except Exception as e:
