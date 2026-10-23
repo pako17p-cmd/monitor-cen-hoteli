@@ -588,11 +588,14 @@ def connect():
     if "current_price" not in departure_columns: con.execute("ALTER TABLE tracked_departures ADD COLUMN current_price REAL")
     if "previous_price" not in departure_columns: con.execute("ALTER TABLE tracked_departures ADD COLUMN previous_price REAL")
     # Attribute legacy history to each hotel's currently selected airport on migration.
-    for hotel in con.execute("SELECT id,url,airport_code,airport_name,country FROM hotels").fetchall():
+    for hotel in con.execute("SELECT id,url,airport_code,airport_name,country,airport_options FROM hotels").fetchall():
         code,name=airport_code_from_url(hotel["url"])
         con.execute("UPDATE hotels SET airport_code=CASE WHEN airport_code='DEFAULT' THEN ? ELSE airport_code END,airport_name=CASE WHEN airport_name='Lotnisko z oferty' THEN ? ELSE airport_name END,country=CASE WHEN country='Kraj nieustalony' THEN ? ELSE country END WHERE id=?",(code,name,country_from_url(hotel["url"]),hotel["id"]))
         con.execute("UPDATE prices SET airport_code=? WHERE hotel_id=? AND airport_code='DEFAULT'",(code,hotel["id"]))
-        con.execute("INSERT OR IGNORE INTO tracked_departures_by_airport(hotel_id,airport_code,departure_date,last_seen_at,missing_checks,status,current_price,previous_price) SELECT hotel_id,?,departure_date,last_seen_at,missing_checks,status,current_price,previous_price FROM tracked_departures WHERE hotel_id=?",(code,hotel["id"]))
+        try: structured=json.loads(hotel["airport_options"]).get("version")==2
+        except (ValueError,AttributeError,TypeError): structured=False
+        if not structured:
+            con.execute("INSERT OR IGNORE INTO tracked_departures_by_airport(hotel_id,airport_code,departure_date,last_seen_at,missing_checks,status,current_price,previous_price) SELECT hotel_id,?,departure_date,last_seen_at,missing_checks,status,current_price,previous_price FROM tracked_departures WHERE hotel_id=?",(code,hotel["id"]))
     con.execute("INSERT OR IGNORE INTO tracked_departures(hotel_id,departure_date,last_seen_at,status) SELECT hotel_id,departure_date,MAX(checked_at),'available' FROM prices WHERE departure_date IS NOT NULL GROUP BY hotel_id,departure_date")
     con.execute("UPDATE tracked_departures SET current_price=(SELECT CASE WHEN p.per_person=1 THEN p.price ELSE p.price/h.people_count END FROM prices p JOIN hotels h ON h.id=p.hotel_id WHERE p.hotel_id=tracked_departures.hotel_id AND p.departure_date=tracked_departures.departure_date ORDER BY p.id DESC LIMIT 1) WHERE current_price IS NULL")
     if fresh_database and con.execute("SELECT COUNT(*) FROM hotels").fetchone()[0]==0: con.executemany("INSERT INTO hotels(name,url) VALUES(?,?)",SEEDS)

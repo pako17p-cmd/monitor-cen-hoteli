@@ -36,3 +36,19 @@ class ItakaVariantsTests(unittest.TestCase):
         with self.assertRaises(ValueError): parse_itaka_variants('<p>Warszawa Poznań</p>',URL)
 
 if __name__=='__main__': unittest.main()
+
+class ItakaMigrationTests(unittest.TestCase):
+    def test_structured_airports_are_not_replaced_by_legacy_dates_on_reconnect(self):
+        import app
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory, patch.object(app,'DB_PATH',str(Path(directory)/'test.db')):
+            c=app.connect()
+            c.execute("UPDATE hotels SET airport_options=?,airport_code='POZ' WHERE id=1",(json.dumps({'version':2}),))
+            c.execute("INSERT INTO tracked_departures(hotel_id,departure_date,status) VALUES(1,'2026-11-01','available')")
+            c.execute("INSERT INTO tracked_departures_by_airport(hotel_id,airport_code,departure_date,status) VALUES(1,'KTW','2026-11-01','available')")
+            c.commit(); c.close()
+            c=app.connect()
+            self.assertEqual([(r['airport_code'],r['departure_date']) for r in c.execute('SELECT * FROM tracked_departures_by_airport')],[('KTW','2026-11-01')])
+            c.close()
