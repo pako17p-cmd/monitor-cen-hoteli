@@ -8,6 +8,8 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 import urllib.request
 from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 import github_state
+from itaka_data import parse_itaka_variants, token_airports
+from concurrent.futures import ThreadPoolExecutor
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "please-change-this-secret-key")
@@ -534,7 +536,7 @@ def country_from_url(url):
     path=urlparse(url).path.lower()
     if "wyspy-kanaryjskie" in path or "teneryfa" in path: return "Hiszpania"
     parts=[p for p in path.split("/") if p]
-    known={"madagaskar":"Madagaskar","grecja":"Grecja","hiszpania":"Hiszpania","turcja":"Turcja","egipt":"Egipt","włochy":"Włochy","wlochy":"Włochy","portugalia":"Portugalia","cypr":"Cypr","tunezja":"Tunezja","maroko":"Maroko","chorwacja":"Chorwacja","dominikana":"Dominikana","meksyk":"Meksyk","kenia":"Kenia","malediwy":"Malediwy","maldives":"Malediwy","wyspy-zielonego-przyladka":"Republika Zielonego Przylądka"}
+    known={"madagaskar":"Madagaskar","grecja":"Grecja","hiszpania":"Hiszpania","turcja":"Turcja","egipt":"Egipt","włochy":"Włochy","wlochy":"Włochy","portugalia":"Portugalia","cypr":"Cypr","tunezja":"Tunezja","maroko":"Maroko","chorwacja":"Chorwacja","dominikana":"Dominikana","meksyk":"Meksyk","zanzibar":"Tanzania (Zanzibar)","kenia":"Kenia","malediwy":"Malediwy","maldives":"Malediwy","wyspy-zielonego-przyladka":"Republika Zielonego Przylądka"}
     for part in parts:
         if part in known: return known[part]
     return "Kraj nieustalony"
@@ -544,24 +546,11 @@ def airport_code_from_url(url):
     query=parse_qsl(urlparse(url).query,keep_blank_values=True)
     direct=next((value.upper() for key,value in query if key.lower()=="airports"),"")
     if direct in AIRPORT_NAMES: return direct,AIRPORT_NAMES[direct]
-    # ITAKA embeds the selected departure airport in its base64-encoded id[0] offer key.
-    # Decode it before falling back to the generic label so existing seeded offers also
-    # display their airport when the page/API cannot be inspected.
+    # Read the outbound protobuf field; the return airport may be different.
     for key,value in query:
-        if not key.lower().startswith("id") or not value: continue
-        candidates=[value]
-        try: candidates.append(unquote(value))
-        except Exception: pass
-        for candidate in candidates:
-            try:
-                token=candidate.strip()
-                token += "="*((4-len(token)%4)%4)
-                decoded=base64.urlsafe_b64decode(token.encode("ascii")).decode("latin1",errors="ignore").upper()
-            except Exception:
-                continue
-            for code in AIRPORT_NAMES:
-                if code in decoded:
-                    return code,AIRPORT_NAMES[code]
+        if key.lower().startswith("id") and value:
+            code,_=token_airports(value)
+            if code in AIRPORT_NAMES: return code,AIRPORT_NAMES[code]
     return "DEFAULT","Lotnisko z oferty"
 
 def connect():
@@ -858,6 +847,8 @@ def refresh_airport_options():
             c.execute("UPDATE hotels SET airport_options=? WHERE id=?",(json.dumps(payload,ensure_ascii=False),hotel["id"]))
             c.commit(); c.close()
         elif is_itaka_url(hotel["url"]):
+            if isinstance(cached,dict) and cached.get("version")==2:
+                continue  # Refreshed from actual variants by run_checks, not filter checkboxes.
             updated=cached.get("updated_at","") if isinstance(cached,dict) else ""
             try: fresh=datetime.fromisoformat(updated)>cutoff
             except (TypeError,ValueError): fresh=False
@@ -962,10 +953,68 @@ def api_remove(hid):
     try: save_state_to_github()
     except Exception as e: app.logger.exception("Could not save hotel deletion to GitHub"); return jsonify(error=f"Nie udało się zapisać zmiany w GitHubie: {e}"),503
     return jsonify(ok=True)
+def check_itaka_hotel(hotel, max_departure):
+    req=urllib.request.Request(hotel['url'],headers={"User-Agent":"Mozilla/5.0","Accept-Language":"pl-PL,pl;q=0.9"})
+    with urllib.request.urlopen(req,timeout=45) as response:
+        html=response.read().decode("utf-8",errors="replace")
+    variants,available=parse_itaka_variants(html,hotel['url'],hotel['people_count'],with_airports=True)
+    def per_airport(option):
+        parts=urlparse(hotel['url'])
+        query=[(k,v) for k,v in parse_qsl(parts.query,keep_blank_values=True) if k!='airports']
+        target=urlunparse(parts._replace(query=urlencode(query+[("airports",option['code'])])))
+        request=urllib.request.Request(target,headers={"User-Agent":"Mozilla/5.0","Accept-Language":"pl-PL,pl;q=0.9"})
+        with urllib.request.urlopen(request,timeout=45) as response:
+            data=response.read().decode("utf-8",errors="replace")
+        return [v for v in parse_itaka_variants(data,target,hotel['people_count']) if v['code']==option['code']]
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        for extra in pool.map(per_airport,available): variants.extend(extra)
+    best={}
+    for v in variants:
+        key=(v['date'],v['code'])
+        if key not in best or v['price']<best[key]['price']: best[key]=v
+    variants=list(best.values())
+    variants=[v for v in variants if v['date']<=max_departure]
+    if not variants: raise ValueError("Brak potwierdzonych wariantów ITAKA w monitorowanym okresie.")
+    stamp=datetime.utcnow().replace(microsecond=0).isoformat()
+    by_date={}
+    for v in variants:
+        by_date.setdefault(v['date'],dict(updated_at=stamp,airports=[]))['airports'].append(v)
+    c=connect()
+    try:
+        cached=_decode_airport_options(c.execute("SELECT airport_options FROM hotels WHERE id=?",(hotel['id'],)).fetchone()[0])
+        if not isinstance(cached,dict) or cached.get('version')!=2:
+            # Previous calendar reads mixed departure airports. Retain those observations
+            # as unverified history instead of attaching them to an invented flight.
+            c.execute("UPDATE prices SET airport_code='LEGACY-ITAKA' WHERE hotel_id=?",(hotel['id'],))
+            c.execute("INSERT OR IGNORE INTO tracked_departures_by_airport(hotel_id,airport_code,departure_date,last_seen_at,missing_checks,status,current_price,previous_price) SELECT hotel_id,'LEGACY-ITAKA',departure_date,last_seen_at,missing_checks,'unavailable',current_price,previous_price FROM tracked_departures_by_airport WHERE hotel_id=?",(hotel['id'],))
+            c.execute("DELETE FROM tracked_departures_by_airport WHERE hotel_id=? AND airport_code!='LEGACY-ITAKA'",(hotel['id'],))
+        for v in variants:
+            previous=c.execute("SELECT price,per_person FROM prices WHERE hotel_id=? AND airport_code=? AND departure_date=? ORDER BY id DESC LIMIT 1",(hotel['id'],v['code'],v['date'])).fetchone()
+            old=(previous['price'] if previous['per_person'] else previous['price']/hotel['people_count']) if previous else None
+            if old is None or abs(old-v['price'])>=0.01:
+                c.execute("INSERT INTO prices(hotel_id,checked_at,price,departure_date,per_person,airport_code) VALUES(?,?,?,?,1,?)",(hotel['id'],stamp,v['price'],v['date'],v['code']))
+            c.execute("INSERT INTO tracked_departures_by_airport(hotel_id,airport_code,departure_date,last_seen_at,missing_checks,status,current_price,previous_price) VALUES(?,?,?,?,0,'available',?,NULL) ON CONFLICT(hotel_id,airport_code,departure_date) DO UPDATE SET last_seen_at=excluded.last_seen_at,missing_checks=0,status='available',previous_price=tracked_departures_by_airport.current_price,current_price=excluded.current_price",(hotel['id'],v['code'],v['date'],stamp,v['price']))
+        seen={(v['date'],v['code']) for v in variants}
+        for old in c.execute("SELECT departure_date,airport_code FROM tracked_departures_by_airport WHERE hotel_id=? AND departure_date>=date('now') AND departure_date<=? AND airport_code!='LEGACY-ITAKA'",(hotel['id'],max_departure)).fetchall():
+            if (old['departure_date'],old['airport_code']) not in seen:
+                c.execute("UPDATE tracked_departures_by_airport SET missing_checks=missing_checks+1,status=CASE WHEN missing_checks+1>=2 THEN 'unavailable' ELSE status END WHERE hotel_id=? AND departure_date=? AND airport_code=?",(hotel['id'],old['departure_date'],old['airport_code']))
+        original=airport_code_from_url(hotel['url'])[0]
+        selected=next((v for v in variants if v['code']==original),variants[0])
+        airports=list({v['code']:dict(code=v['code'],name=v['name']) for v in variants}.values())
+        payload=dict(version=2,updated_at=stamp,airports=airports,by_date=by_date)
+        extractor=Extractor();extractor.feed(html)
+        c.execute("UPDATE hotels SET airport_code=?,airport_name=?,airport_options=?,country=?,image_url=COALESCE(?,image_url),last_checked_at=? WHERE id=?",(selected['code'],selected['name'],json.dumps(payload,ensure_ascii=False),country_from_url(hotel['url']),extractor.image_url,stamp,hotel['id']))
+        c.commit()
+    finally: c.close()
+
+
 def run_checks():
     c=connect(); hs=c.execute("SELECT id,url,people_count,airport_code,airport_name,country FROM hotels ORDER BY id").fetchall(); max_departure=c.execute("SELECT date('now','start of month','+3 months','-1 day')").fetchone()[0]; c.close(); errors=0
     for h in hs:
         try:
+            if is_itaka_url(h['url']):
+                check_itaka_hotel(h,max_departure)
+                continue
             result=fetch_offer(h['url'],h['people_count']);
             if len(result)==7: total,image_url,departure_date,calendar_prices,calendar_observed,airport_code,airport_name=result
             else: total,image_url,departure_date,calendar_prices,calendar_observed=result; airport_code,airport_name=airport_code_from_url(h['url'])
@@ -1023,6 +1072,7 @@ def scheduler():
         time.sleep(INTERVAL_SECONDS)
 
 if AUTO_SCHEDULER: threading.Thread(target=scheduler,daemon=True,name="price-scheduler").start()
+
 
 
 
