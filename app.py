@@ -583,6 +583,7 @@ def connect():
     if "per_person" not in price_columns: con.execute("ALTER TABLE prices ADD COLUMN per_person INTEGER NOT NULL DEFAULT 0")
     if "airport_code" not in price_columns: con.execute("ALTER TABLE prices ADD COLUMN airport_code TEXT NOT NULL DEFAULT 'DEFAULT'")
     con.execute("CREATE TABLE IF NOT EXISTS tracked_departures_by_airport(hotel_id INTEGER NOT NULL,airport_code TEXT NOT NULL,departure_date TEXT NOT NULL,last_seen_at TEXT,missing_checks INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'available',current_price REAL,previous_price REAL,PRIMARY KEY(hotel_id,airport_code,departure_date),FOREIGN KEY(hotel_id) REFERENCES hotels(id) ON DELETE CASCADE)")
+    con.execute("CREATE TABLE IF NOT EXISTS availability_events(id INTEGER PRIMARY KEY,hotel_id INTEGER NOT NULL,airport_code TEXT NOT NULL,departure_date TEXT NOT NULL,checked_at TEXT NOT NULL,from_status TEXT NOT NULL,to_status TEXT NOT NULL,price REAL,previous_price REAL,UNIQUE(hotel_id,airport_code,departure_date,checked_at,to_status),FOREIGN KEY(hotel_id) REFERENCES hotels(id) ON DELETE CASCADE)")
     con.execute("CREATE TABLE IF NOT EXISTS tracked_departures(hotel_id INTEGER NOT NULL,departure_date TEXT NOT NULL,last_seen_at TEXT,missing_checks INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'available',PRIMARY KEY(hotel_id,departure_date),FOREIGN KEY(hotel_id) REFERENCES hotels(id) ON DELETE CASCADE)")
     departure_columns={row[1] for row in con.execute("PRAGMA table_info(tracked_departures)").fetchall()}
     if "current_price" not in departure_columns: con.execute("ALTER TABLE tracked_departures ADD COLUMN current_price REAL")
@@ -608,6 +609,7 @@ def state_from_database():
     state={"hotels":[dict(row) for row in c.execute("SELECT id,name,url,people_count,image_url,last_checked_at,country,airport_code,airport_name,airport_options FROM hotels ORDER BY id")],
            "prices":[dict(row) for row in c.execute("SELECT id,hotel_id,checked_at,price,departure_date,per_person,airport_code FROM prices ORDER BY id")],
            "departures":[dict(row) for row in c.execute("SELECT hotel_id,airport_code,departure_date,last_seen_at,missing_checks,status,current_price,previous_price FROM tracked_departures_by_airport ORDER BY hotel_id,airport_code,departure_date")],
+           "availability_events":[dict(row) for row in c.execute("SELECT id,hotel_id,airport_code,departure_date,checked_at,from_status,to_status,price,previous_price FROM availability_events ORDER BY id")],
            "updated_at":datetime.utcnow().replace(microsecond=0).isoformat()}
     c.close()
     return state
@@ -631,6 +633,7 @@ def sync_state_from_github():
     c=connect()
     try:
         c.execute("BEGIN IMMEDIATE")
+        c.execute("DELETE FROM availability_events")
         c.execute("DELETE FROM prices")
         c.execute("DELETE FROM tracked_departures_by_airport")
         c.execute("DELETE FROM tracked_departures")
@@ -641,6 +644,8 @@ def sync_state_from_github():
                       [(p["id"],p["hotel_id"],p["checked_at"],p["price"],p.get("departure_date"),p.get("per_person",0),p.get("airport_code") or "DEFAULT") for p in state["prices"]])
         c.executemany("INSERT INTO tracked_departures_by_airport(hotel_id,airport_code,departure_date,last_seen_at,missing_checks,status,current_price,previous_price) VALUES(?,?,?,?,?,?,?,?)",
                       [(d["hotel_id"],d.get("airport_code","DEFAULT"),d["departure_date"],d.get("last_seen_at"),d.get("missing_checks",0),d.get("status","available"),d.get("current_price"),d.get("previous_price")) for d in state.get("departures",[])])
+        c.executemany("INSERT INTO availability_events(id,hotel_id,airport_code,departure_date,checked_at,from_status,to_status,price,previous_price) VALUES(?,?,?,?,?,?,?,?,?)",
+                      [(e['id'],e['hotel_id'],e['airport_code'],e['departure_date'],e['checked_at'],e['from_status'],e['to_status'],e.get('price'),e.get('previous_price')) for e in state.get('availability_events',[])])
         c.execute("INSERT OR IGNORE INTO tracked_departures(hotel_id,departure_date,last_seen_at,status) SELECT hotel_id,departure_date,MAX(checked_at),'available' FROM prices WHERE departure_date IS NOT NULL GROUP BY hotel_id,departure_date")
         c.execute("UPDATE tracked_departures SET current_price=(SELECT CASE WHEN p.per_person=1 THEN p.price ELSE p.price/h.people_count END FROM prices p JOIN hotels h ON h.id=p.hotel_id WHERE p.hotel_id=tracked_departures.hotel_id AND p.departure_date=tracked_departures.departure_date ORDER BY p.id DESC LIMIT 1) WHERE current_price IS NULL")
         c.commit()
@@ -956,6 +961,13 @@ def api_remove(hid):
     try: save_state_to_github()
     except Exception as e: app.logger.exception("Could not save hotel deletion to GitHub"); return jsonify(error=f"Nie udało się zapisać zmiany w GitHubie: {e}"),503
     return jsonify(ok=True)
+def record_availability_transition(c, hotel_id, airport_code, departure_date, status, stamp, price=None):
+    """Append a real observed status change before updating the current state."""
+    previous=c.execute("SELECT status,current_price FROM tracked_departures_by_airport WHERE hotel_id=? AND airport_code=? AND departure_date=?",(hotel_id,airport_code,departure_date)).fetchone()
+    if previous and previous['status'] in ('available','unavailable') and previous['status']!=status:
+        c.execute("INSERT OR IGNORE INTO availability_events(hotel_id,airport_code,departure_date,checked_at,from_status,to_status,price,previous_price) VALUES(?,?,?,?,?,?,?,?)",(hotel_id,airport_code,departure_date,stamp,previous['status'],status,price if status=='available' else None,previous['current_price']))
+
+
 def check_itaka_hotel(hotel, max_departure):
     req=urllib.request.Request(hotel['url'],headers={"User-Agent":"Mozilla/5.0","Accept-Language":"pl-PL,pl;q=0.9"})
     with urllib.request.urlopen(req,timeout=45) as response:
@@ -1011,10 +1023,12 @@ def check_itaka_hotel(hotel, max_departure):
             old=(previous['price'] if previous['per_person'] else previous['price']/hotel['people_count']) if previous else None
             if old is None or abs(old-v['price'])>=0.01:
                 c.execute("INSERT INTO prices(hotel_id,checked_at,price,departure_date,per_person,airport_code) VALUES(?,?,?,?,1,?)",(hotel['id'],stamp,v['price'],v['date'],v['code']))
+            record_availability_transition(c,hotel['id'],v['code'],v['date'],'available',stamp,v['price'])
             c.execute("INSERT INTO tracked_departures_by_airport(hotel_id,airport_code,departure_date,last_seen_at,missing_checks,status,current_price,previous_price) VALUES(?,?,?,?,0,'available',?,NULL) ON CONFLICT(hotel_id,airport_code,departure_date) DO UPDATE SET last_seen_at=excluded.last_seen_at,missing_checks=0,status='available',previous_price=tracked_departures_by_airport.current_price,current_price=excluded.current_price",(hotel['id'],v['code'],v['date'],stamp,v['price']))
         seen={(v['date'],v['code']) for v in variants}
         for old in c.execute("SELECT departure_date,airport_code FROM tracked_departures_by_airport WHERE hotel_id=? AND departure_date>=date('now') AND departure_date<=? AND airport_code!='LEGACY-ITAKA'",(hotel['id'],max_departure)).fetchall():
             if (old['departure_date'],old['airport_code']) not in seen:
+                record_availability_transition(c,hotel['id'],old['airport_code'],old['departure_date'],'unavailable',stamp)
                 c.execute("UPDATE tracked_departures_by_airport SET missing_checks=missing_checks+1,status='unavailable' WHERE hotel_id=? AND departure_date=? AND airport_code=?",(hotel['id'],old['departure_date'],old['airport_code']))
         original=airport_code_from_url(hotel['url'])[0]
         selected=next((v for v in variants if v['code']==original),variants[0])
@@ -1061,10 +1075,12 @@ def run_checks():
             if calendar_observed:
                 seen_dates={date_value for date_value,_ in calendar_prices}
                 for date_value in seen_dates:
+                    record_availability_transition(c,h['id'],airport_code,date_value,'available',stamp,dict(calendar_prices)[date_value])
                     c.execute("INSERT INTO tracked_departures_by_airport(hotel_id,airport_code,departure_date,last_seen_at,missing_checks,status,current_price,previous_price) VALUES(?,?,?, ?,0,'available',?,NULL) ON CONFLICT(hotel_id,airport_code,departure_date) DO UPDATE SET last_seen_at=excluded.last_seen_at,missing_checks=0,status='available',previous_price=tracked_departures_by_airport.current_price,current_price=excluded.current_price",(h['id'],airport_code,date_value,stamp,dict(calendar_prices)[date_value]))
                 known=c.execute("SELECT departure_date FROM tracked_departures_by_airport WHERE hotel_id=? AND airport_code=? AND departure_date>=date('now') AND departure_date<=?",(h['id'],airport_code,max_departure)).fetchall()
                 for record in known:
                     if record['departure_date'] not in seen_dates:
+                        record_availability_transition(c,h['id'],airport_code,record['departure_date'],'unavailable',stamp)
                         c.execute("UPDATE tracked_departures_by_airport SET missing_checks=missing_checks+1,status='unavailable' WHERE hotel_id=? AND airport_code=? AND departure_date=?",(h['id'],airport_code,record['departure_date']))
             c.execute("UPDATE hotels SET image_url=COALESCE(?,image_url),last_checked_at=?,country=?,airport_code=?,airport_name=? WHERE id=?",(image_url,stamp,country_from_url(h['url']),airport_code,airport_name,h['id']))
             c.commit(); c.close()

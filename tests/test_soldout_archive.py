@@ -57,4 +57,39 @@ class SoldOutTests(unittest.TestCase):
     def test_rainbow_incomplete_calendar_does_not_archive(self):
         self.rainbow(False);self.assertEqual(self.old_record()['status'],'available')
 
+    def test_availability_events_are_append_only_and_survive_export_import(self):
+        import os
+        self.check_itaka([self.variant])
+        self.check_itaka([self.variant])
+        self.check_itaka([self.option,self.variant])
+        state=app.state_from_database()
+        events=state['availability_events']
+        self.assertEqual([(e['from_status'],e['to_status']) for e in events],[('available','unavailable'),('unavailable','available')])
+        self.assertEqual(events[0]['price'],None)
+        self.assertEqual(events[0]['previous_price'],1000)
+        self.assertEqual(events[1]['price'],1000)  # Returning at the same price is still an event.
+        self.assertTrue(all(e['checked_at'] and e['departure_date']==self.old and e['airport_code']=='WAW' for e in events))
+        with patch.dict(os.environ,{'GITHUB_TOKEN':'test'}),patch.object(app.github_state,'read_state',return_value=state):
+            app.sync_state_from_github()
+        self.assertEqual(app.state_from_database()['availability_events'],events)
+        self.check_itaka([self.option,self.variant])
+        self.assertEqual(app.state_from_database()['availability_events'],events)
+
+    def test_failed_check_and_old_snapshot_do_not_invent_events(self):
+        import os
+        self.assertEqual(app.state_from_database()['availability_events'],[])
+        with patch.object(app.urllib.request,'urlopen',side_effect=TimeoutError('network')):
+            with self.assertRaises(TimeoutError):app.check_itaka_hotel(self.hotel(),self.limit)
+        self.assertEqual(app.state_from_database()['availability_events'],[])
+        old=app.state_from_database();old.pop('availability_events')
+        with patch.dict(os.environ,{'GITHUB_TOKEN':'test'}),patch.object(app.github_state,'read_state',return_value=old):app.sync_state_from_github()
+        self.assertEqual(app.state_from_database()['availability_events'],[])
+
+    def test_rainbow_records_transition_once(self):
+        self.rainbow(True)
+        events=app.state_from_database()['availability_events']
+        self.assertEqual(len(events),1);self.assertEqual(events[0]['to_status'],'unavailable')
+        self.rainbow(True)
+        self.assertEqual(app.state_from_database()['availability_events'],events)
+
 if __name__=='__main__':unittest.main()
