@@ -171,6 +171,48 @@ def rainbow_calendar_target():
     month=month_index%12+1
     return f"{RAINBOW_MONTH_NAMES[f'{month:02d}']} {year}"
 
+class RainbowConfigurationUnavailable(Exception):
+    """The provider explicitly rejected this offer key, not the entire hotel."""
+    def __init__(self,url):
+        self.url=sanitize_rainbow_url(url)
+        super().__init__("Rainbow: oferta dostępna w innej konfiguracji")
+
+RAINBOW_UNAVAILABLE_PATTERN=re.compile(r"Oferta\s+dostępna\s+w\s+innej\s+konfiguracji",re.I)
+
+def wait_for_rainbow_configuration(page,url):
+    # Race both real outcomes: a sold-out configuration must not wait for a price.
+    page.get_by_text(re.compile(r"Cena\s+razem|Oferta\s+dostępna\s+w\s+innej\s+konfiguracji",re.I)).first.wait_for(state="visible",timeout=30000)
+    if page.get_by_text(RAINBOW_UNAVAILABLE_PATTERN).first.is_visible():
+        raise RainbowConfigurationUnavailable(url)
+
+def record_rainbow_unavailable(hotel,url):
+    """Resolve an exact saved offer key to a single departure and airport."""
+    def identity(value):
+        parts=urlparse(sanitize_rainbow_url(value))
+        key=dict(parse_qsl(parts.query)).get('unikalnyKluczOferty')
+        return (parts.hostname,parts.path.rstrip('/'),key) if key else None
+    target=identity(url)
+    cache=_decode_airport_options(hotel['airport_options'])
+    matches=set()
+    if target and isinstance(cache,dict):
+        for date,entry in cache.get('by_date',{}).items():
+            for option in entry.get('airports',[]):
+                if option.get('code') and identity(option.get('url',''))==target:
+                    matches.add((date,option['code']))
+    if len(matches)!=1:
+        raise ValueError('Nie można jednoznacznie przypisać niedostępnej konfiguracji Rainbow do terminu i lotniska.')
+    date,airport=matches.pop()
+    stamp=datetime.utcnow().replace(microsecond=0).isoformat()
+    c=connect()
+    try:
+        record_availability_transition(c,hotel['id'],airport,date,'unavailable',stamp)
+        c.execute("UPDATE tracked_departures_by_airport SET missing_checks=missing_checks+1,status='unavailable' WHERE hotel_id=? AND airport_code=? AND departure_date=?",(hotel['id'],airport,date))
+        c.execute("UPDATE hotels SET last_checked_at=? WHERE id=?",(stamp,hotel['id']))
+        c.commit()
+    finally:
+        c.close()
+    app.logger.info('Rainbow configuration unavailable: hotel %s, %s, %s',hotel['id'],date,airport)
+
 def fetch_rainbow_offer(url, people_count=2):
     """Retry one transient browser/consent failure in a fresh context."""
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -193,10 +235,7 @@ def _fetch_rainbow_offer_once(url, people_count=2):
         try:
             page=browser.new_page(locale="pl-PL",timezone_id="Europe/Warsaw")
             page.goto(safe_url,wait_until="domcontentloaded",timeout=60000)
-            try:
-                page.get_by_text(re.compile(r"Cena\s+razem",re.I)).first.wait_for(state="visible",timeout=30000)
-            except Exception:
-                page.locator("body").wait_for(state="visible",timeout=10000)
+            wait_for_rainbow_configuration(page,safe_url)
 
             dismiss_rainbow_cookie_overlay(page)
             # A second consent prompt can mount while the configurator loads.
@@ -240,6 +279,8 @@ def _fetch_rainbow_offer_once(url, people_count=2):
                 samples=page.get_by_role("button").evaluate_all("""buttons => buttons.filter(b => /20\\d{2}/.test((b.getAttribute('aria-label')||'')+' '+(b.getAttribute('title')||'')+' '+(b.innerText||b.textContent||''))).slice(0,20).map(b => ({label:b.getAttribute('aria-label')||b.getAttribute('title')||'', text:b.innerText||b.textContent||''}))""")
                 app.logger.warning("Rainbow calendar sample buttons: %s",samples)
                 raise ValueError("Rainbow nie udostępniło cen w kalendarzu wyjazdów.")
+        except RainbowConfigurationUnavailable:
+            raise
         except Exception:
             save_rainbow_failure_debug(page,safe_url,"prices")
             raise
@@ -432,7 +473,7 @@ def rainbow_airport_variants(url, departure_date=None, selected_code=None):
         try:
             page=browser.new_page(locale="pl-PL",timezone_id="Europe/Warsaw")
             page.goto(safe_url,wait_until="domcontentloaded",timeout=60000)
-            page.get_by_text(re.compile(r"Cena\s+razem",re.I)).first.wait_for(state="visible",timeout=30000)
+            wait_for_rainbow_configuration(page,safe_url)
             dismiss_rainbow_cookie_overlay(page)
             try:
                 page.locator('[id-dti="loader"]').wait_for(state="hidden",timeout=10000)
@@ -491,6 +532,8 @@ def rainbow_airport_variants(url, departure_date=None, selected_code=None):
                     page.wait_for_function("(previous)=>location.href!==previous",arg=before_select,timeout=30000)
                     page.get_by_role("button",name=re.compile(r"^\s*"+re.escape(option["name"])+r"\s+wylot",re.I)).first.wait_for(state="visible",timeout=20000)
             return {"url":sanitize_rainbow_url(page.url),"airports":airports}
+        except RainbowConfigurationUnavailable:
+            raise
         except Exception:
             save_rainbow_failure_debug(page,safe_url,str(departure_date or "airports"))
             raise
@@ -834,11 +877,14 @@ def refresh_airport_options():
                 except (TypeError,ValueError): fresh=False
                 if fresh and entry.get("airports") and all(item.get("url") for item in entry["airports"]):
                     continue
+                # Each date has its own offer key; do not reuse a sold-out base trip.
+                candidates=sorted(entry.get('airports',[]),key=lambda item:item.get('code')!=hotel['airport_code'])
+                source_url=next((item['url'] for item in candidates if item.get('url')),hotel['url'])
                 try:
-                    found=rainbow_airport_variants(hotel["url"],departure_date)["airports"]
+                    found=rainbow_airport_variants(source_url,departure_date)["airports"]
                     options=[]
                     for candidate in found:
-                        selected=rainbow_airport_variants(hotel["url"],departure_date,candidate["code"])
+                        selected=rainbow_airport_variants(source_url,departure_date,candidate["code"])
                         variant_url=sanitize_rainbow_url(selected["url"])
                         if not is_rainbow_url(variant_url):
                             raise ValueError("Rainbow nie zwróciło poprawnego linku wybranego lotu.")
@@ -847,6 +893,12 @@ def refresh_airport_options():
                         raise ValueError("Nie znaleziono lotnisk dla tego terminu.")
                     by_date[departure_date]=dict(updated_at=now.isoformat(),airports=options)
                     checked+=1
+                except RainbowConfigurationUnavailable as exc:
+                    try:
+                        record_rainbow_unavailable(hotel,exc.url)
+                    except Exception as error:
+                        errors+=1
+                        app.logger.warning("Could not identify unavailable Rainbow airport configuration for hotel %s: %s",hotel['id'],error)
                 except Exception as exc:
                     errors+=1
                     app.logger.warning("Could not refresh Rainbow airports for hotel %s and %s: %s",hotel["id"],departure_date,exc)
@@ -1041,7 +1093,7 @@ def check_itaka_hotel(hotel, max_departure):
 
 
 def run_checks():
-    c=connect(); hs=c.execute("SELECT id,url,people_count,airport_code,airport_name,country FROM hotels ORDER BY id").fetchall(); max_departure=c.execute("SELECT date('now','start of month','+3 months','-1 day')").fetchone()[0]; c.close(); errors=0
+    c=connect(); hs=c.execute("SELECT id,url,people_count,airport_code,airport_name,country,airport_options FROM hotels ORDER BY id").fetchall(); max_departure=c.execute("SELECT date('now','start of month','+3 months','-1 day')").fetchone()[0]; c.close(); errors=0
     for h in hs:
         try:
             if is_itaka_url(h['url']):
@@ -1084,6 +1136,11 @@ def run_checks():
                         c.execute("UPDATE tracked_departures_by_airport SET missing_checks=missing_checks+1,status='unavailable' WHERE hotel_id=? AND airport_code=? AND departure_date=?",(h['id'],airport_code,record['departure_date']))
             c.execute("UPDATE hotels SET image_url=COALESCE(?,image_url),last_checked_at=?,country=?,airport_code=?,airport_name=? WHERE id=?",(image_url,stamp,country_from_url(h['url']),airport_code,airport_name,h['id']))
             c.commit(); c.close()
+        except RainbowConfigurationUnavailable as exc:
+            try:
+                record_rainbow_unavailable(h,exc.url)
+            except Exception as error:
+                errors+=1; app.logger.warning("Could not identify unavailable Rainbow configuration for hotel %s: %s",h['id'],error)
         except Exception as e:
             errors+=1; app.logger.warning("Price check failed for hotel %s: %s",h['id'],e)
     return len(hs),errors

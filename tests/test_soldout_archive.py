@@ -92,4 +92,57 @@ class SoldOutTests(unittest.TestCase):
         self.rainbow(True)
         self.assertEqual(app.state_from_database()['availability_events'],events)
 
+    def rainbow_configuration(self):
+        url='https://r.pl/hotel?unikalnyKluczOferty=one&liczbaPokoi=1'
+        other='https://r.pl/hotel?unikalnyKluczOferty=two'
+        options={'version':1,'by_date':{
+            self.old:{'airports':[{'code':'WAW','url':url},{'code':'KTW','url':other}]},
+            self.new:{'airports':[{'code':'WAW','url':'https://r.pl/hotel?unikalnyKluczOferty=three'}]}}}
+        c=app.connect()
+        c.execute('UPDATE hotels SET url=?,airport_options=? WHERE id=1',(url,json.dumps(options)))
+        c.execute("INSERT INTO tracked_departures_by_airport(hotel_id,airport_code,departure_date,status,current_price) VALUES(1,'KTW',?,'available',1100)",(self.old,))
+        c.execute("INSERT INTO tracked_departures_by_airport(hotel_id,airport_code,departure_date,status,current_price) VALUES(1,'WAW',?,'available',1200)",(self.new,))
+        c.commit();c.close()
+        return url
+
+    def test_explicit_rainbow_configuration_is_scoped_and_logged_once(self):
+        url=self.rainbow_configuration()
+        with patch.object(app,'fetch_offer',side_effect=app.RainbowConfigurationUnavailable(url)):
+            self.assertEqual(app.run_checks(),(1,0))
+            self.assertEqual(app.run_checks(),(1,0))
+        state=app.state_from_database()
+        self.assertEqual(self.old_record()['status'],'unavailable')
+        others=[d for d in state['departures'] if (d['airport_code'],d['departure_date'])!=('WAW',self.old)]
+        self.assertTrue(all(d['status']=='available' for d in others))
+        self.assertEqual(len(state['availability_events']),1)
+        self.assertEqual(state['availability_events'][0]['previous_price'],1000)
+        # A genuine return to the same price creates a second event.
+        result=(2000,None,self.old,[(self.old,1000),(self.new,1200)],True,'WAW','Warszawa')
+        with patch.object(app,'fetch_offer',return_value=result):
+            self.assertEqual(app.run_checks(),(1,0))
+        self.assertEqual(self.old_record()['status'],'available')
+        self.assertEqual([e['to_status'] for e in app.state_from_database()['availability_events']],['unavailable','available'])
+
+    def test_unidentified_rainbow_configuration_does_not_archive_other_trips(self):
+        self.rainbow_configuration()
+        with patch.object(app,'fetch_offer',side_effect=app.RainbowConfigurationUnavailable('https://r.pl/hotel?unikalnyKluczOferty=unknown')):
+            self.assertEqual(app.run_checks(),(1,1))
+        self.assertEqual(self.old_record()['status'],'available')
+        self.assertEqual(app.state_from_database()['availability_events'],[])
+
+    def test_rainbow_airport_refresh_uses_date_specific_link(self):
+        url=self.rainbow_configuration()
+        c=app.connect()
+        c.execute("INSERT INTO prices(hotel_id,checked_at,price,departure_date,per_person,airport_code) VALUES(1,?,1200,?,1,'WAW')",(datetime.utcnow().isoformat(),self.new))
+        c.commit();c.close()
+        def inspect(link,date,selected_code=None):
+            if link==url: raise app.RainbowConfigurationUnavailable(url)
+            self.assertEqual(link,'https://r.pl/hotel?unikalnyKluczOferty=three')
+            return {'url':link,'airports':[{'code':'WAW','name':'Warszawa'}]}
+        with patch.object(app,'rainbow_airport_variants',side_effect=inspect):
+            self.assertEqual(app.refresh_airport_options(),(1,0))
+        self.assertEqual(self.old_record()['status'],'unavailable')
+        state=app.state_from_database()
+        self.assertEqual(len(state['availability_events']),1)
+
 if __name__=='__main__':unittest.main()
