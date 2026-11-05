@@ -1102,11 +1102,13 @@ def check_itaka_hotel(hotel, max_departure):
             record_availability_transition(c,hotel['id'],v['code'],v['date'],'available',stamp,v['price'])
             c.execute("INSERT INTO tracked_departures_by_airport(hotel_id,airport_code,departure_date,last_seen_at,missing_checks,status,current_price,previous_price) VALUES(?,?,?,?,0,'available',?,NULL) ON CONFLICT(hotel_id,airport_code,departure_date) DO UPDATE SET last_seen_at=excluded.last_seen_at,missing_checks=0,status='available',previous_price=tracked_departures_by_airport.current_price,current_price=excluded.current_price",(hotel['id'],v['code'],v['date'],stamp,v['price']))
         seen={(v['date'],v['code']) for v in variants}
-        for old in c.execute("SELECT departure_date,airport_code FROM tracked_departures_by_airport WHERE hotel_id=? AND departure_date>=date('now') AND departure_date<=? AND airport_code!='LEGACY-ITAKA'",(hotel['id'],max_departure)).fetchall():
+        for old in c.execute("SELECT departure_date,airport_code,status FROM tracked_departures_by_airport WHERE hotel_id=? AND departure_date>=date('now') AND departure_date<=? AND airport_code!='LEGACY-ITAKA'",(hotel['id'],max_departure)).fetchall():
             if (old['departure_date'],old['airport_code']) not in seen:
                 if (old['departure_date'],old['airport_code']) in rejected:
                     c.execute("UPDATE tracked_departures_by_airport SET status='excluded_duration' WHERE hotel_id=? AND departure_date=? AND airport_code=?",(hotel['id'],old['departure_date'],old['airport_code']))
                     continue
+                if old['status']=='excluded_duration':
+                    continue  # Keep filtered history hidden until an eligible stay is actually seen.
                 record_availability_transition(c,hotel['id'],old['airport_code'],old['departure_date'],'unavailable',stamp)
                 c.execute("UPDATE tracked_departures_by_airport SET missing_checks=missing_checks+1,status='unavailable' WHERE hotel_id=? AND departure_date=? AND airport_code=?",(hotel['id'],old['departure_date'],old['airport_code']))
         original=airport_code_from_url(hotel['url'])[0]

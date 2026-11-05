@@ -201,5 +201,8 @@ class SoldOutTests(unittest.TestCase):
         cache=json.loads(self.hotel()['airport_options'])
         self.assertEqual(cache['by_date'][self.new]['airports'][0]['nights'],14)
         self.assertEqual(cache['excluded_by_date'][0]['nights'],4)
+        with patch.object(app.urllib.request,'urlopen',return_value=response),patch.object(app,'parse_itaka_variants',return_value=([long],[],[])):
+            app.check_itaka_hotel(self.hotel(),self.limit)
+        self.assertEqual(self.old_record()['status'],'excluded_duration')
 
 if __name__=='__main__':unittest.main()
