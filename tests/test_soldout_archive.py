@@ -188,4 +188,18 @@ class SoldOutTests(unittest.TestCase):
         self.assertEqual(len(app.state_from_database()['prices']),1)
         self.assertEqual(app.state_from_database()['availability_events'],[])
 
+    def test_short_itaka_stay_is_excluded_without_erasing_history_or_soldout_event(self):
+        short={**self.option,'nights':4,'exclusion_reason':'short_stay'}
+        long={**self.variant,'nights':14}
+        response=MagicMock();response.__enter__.return_value.read.return_value=b'page'
+        with patch.object(app.urllib.request,'urlopen',return_value=response),patch.object(app,'parse_itaka_variants',return_value=([long],[],[short])):
+            app.check_itaka_hotel(self.hotel(),self.limit)
+        self.assertEqual(self.old_record()['status'],'excluded_duration')
+        state=app.state_from_database()
+        self.assertEqual(state['prices'][0]['price'],1000)
+        self.assertEqual(state['availability_events'],[])
+        cache=json.loads(self.hotel()['airport_options'])
+        self.assertEqual(cache['by_date'][self.new]['airports'][0]['nights'],14)
+        self.assertEqual(cache['excluded_by_date'][0]['nights'],4)
+
 if __name__=='__main__':unittest.main()

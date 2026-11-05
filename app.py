@@ -10,7 +10,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 import urllib.request
 from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 import github_state
-from itaka_data import parse_itaka_variants, token_airports
+from itaka_data import parse_itaka_variants, token_airports, variant_rank
 from concurrent.futures import ThreadPoolExecutor
 
 app = Flask(__name__)
@@ -1041,22 +1041,31 @@ def fetch_itaka_html(url):
 
 def check_itaka_hotel(hotel, max_departure):
     html=fetch_itaka_html(hotel['url'])
-    variants,available=parse_itaka_variants(html,hotel['url'],hotel['people_count'],with_airports=True)
+    parsed=parse_itaka_variants(html,hotel['url'],hotel['people_count'],with_airports=True,with_rejected=True)
+    variants,available=parsed[:2]
+    rejected=list(parsed[2]) if len(parsed)>2 else []
     def per_airport(option):
         parts=urlparse(hotel['url'])
         query=[(k,v) for k,v in parse_qsl(parts.query,keep_blank_values=True) if k!='airports']
         target=urlunparse(parts._replace(query=urlencode(query+[("airports",option['code'])])))
         data=fetch_itaka_html(target)
-        return [v for v in parse_itaka_variants(data,target,hotel['people_count']) if v['code']==option['code']]
+        parsed=parse_itaka_variants(data,target,hotel['people_count'],with_rejected=True)
+        if isinstance(parsed,tuple):
+            extra,_,excluded=parsed
+        else:extra,excluded=parsed,[]
+        return [v for v in extra if v['code']==option['code']],[v for v in excluded if v['code']==option['code']]
     with ThreadPoolExecutor(max_workers=3) as pool:
-        for extra in pool.map(per_airport,available): variants.extend(extra)
+        for extra,excluded in pool.map(per_airport,available):
+            variants.extend(extra);rejected.extend(excluded)
     best={}
     for v in variants:
         key=(v['date'],v['code'])
-        if key not in best or v['price']<best[key]['price']: best[key]=v
+        if key not in best or variant_rank(v,hotel['url'])<variant_rank(best[key],hotel['url']): best[key]=v
     variants=list(best.values())
     variants=[v for v in variants if v['date']<=max_departure]
-    if not variants: raise ValueError("Brak potwierdzonych wariantów ITAKA w monitorowanym okresie.")
+    seen={(v['date'],v['code']) for v in variants}
+    rejected={(v['date'],v['code']):v for v in rejected if v['date']<=max_departure and (v['date'],v['code']) not in seen}
+    if not variants and not rejected: raise ValueError("Brak potwierdzonych wariantów ITAKA w monitorowanym okresie.")
     stamp=datetime.utcnow().replace(microsecond=0).isoformat()
     by_date={}
     for v in variants:
@@ -1095,12 +1104,15 @@ def check_itaka_hotel(hotel, max_departure):
         seen={(v['date'],v['code']) for v in variants}
         for old in c.execute("SELECT departure_date,airport_code FROM tracked_departures_by_airport WHERE hotel_id=? AND departure_date>=date('now') AND departure_date<=? AND airport_code!='LEGACY-ITAKA'",(hotel['id'],max_departure)).fetchall():
             if (old['departure_date'],old['airport_code']) not in seen:
+                if (old['departure_date'],old['airport_code']) in rejected:
+                    c.execute("UPDATE tracked_departures_by_airport SET status='excluded_duration' WHERE hotel_id=? AND departure_date=? AND airport_code=?",(hotel['id'],old['departure_date'],old['airport_code']))
+                    continue
                 record_availability_transition(c,hotel['id'],old['airport_code'],old['departure_date'],'unavailable',stamp)
                 c.execute("UPDATE tracked_departures_by_airport SET missing_checks=missing_checks+1,status='unavailable' WHERE hotel_id=? AND departure_date=? AND airport_code=?",(hotel['id'],old['departure_date'],old['airport_code']))
         original=airport_code_from_url(hotel['url'])[0]
-        selected=next((v for v in variants if v['code']==original),variants[0])
+        selected=next((v for v in variants if v['code']==original),variants[0] if variants else dict(code=hotel['airport_code'],name=hotel['airport_name']))
         airports=list({v['code']:dict(code=v['code'],name=v['name']) for v in variants}.values())
-        payload=dict(version=2,updated_at=stamp,airports=airports,by_date=by_date,known_by_date=known_by_date)
+        payload=dict(version=2,updated_at=stamp,stay_policy=dict(min_nights=6),excluded_by_date=[dict(date=v['date'],code=v['code'],nights=v.get('nights'),reason=v.get('exclusion_reason')) for v in rejected.values()],airports=airports,by_date=by_date,known_by_date=known_by_date)
         extractor=Extractor();extractor.feed(html)
         c.execute("UPDATE hotels SET airport_code=?,airport_name=?,airport_options=?,country=?,image_url=COALESCE(?,image_url),last_checked_at=? WHERE id=?",(selected['code'],selected['name'],json.dumps(payload,ensure_ascii=False),country_from_url(hotel['url']),extractor.image_url,stamp,hotel['id']))
         c.commit()

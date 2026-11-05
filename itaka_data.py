@@ -43,7 +43,13 @@ def offer_url(url, code, token):
     return urlunparse(p._replace(query=urlencode(query)))
 
 
-def parse_itaka_variants(html, url, people=2, with_airports=False):
+def variant_rank(variant,url):
+    # Serenade is compared primarily as a week-long stay; longer stays remain eligible.
+    preferred=0 if 'PUJSERE' not in url.upper() or variant.get('nights')==7 else 1
+    return preferred,variant['price']
+
+
+def parse_itaka_variants(html, url, people=2, with_airports=False, with_rejected=False):
     chunks = []
     for match in re.finditer(r'self\.__next_f\.push\((\[.*?\])\)</script>', html, re.S):
         try:
@@ -74,7 +80,7 @@ def parse_itaka_variants(html, url, people=2, with_airports=False):
         value = resolve(value)
         return value if isinstance(value, dict) else {}
 
-    found = {}; airports = {}
+    found = {}; airports = {}; rejected = {}
     def walk(value):
         if isinstance(value, list):
             for item in value: walk(item)
@@ -101,14 +107,23 @@ def parse_itaka_variants(html, url, people=2, with_airports=False):
                 if not total: total = obj(value.get('priceWithAdditionalPayments'))
                 amount = total.get('amount')
                 if re.fullmatch(r'20\d\d-\d\d-\d\d', str(date)) and isinstance(amount, (int, float)) and amount > 0:
+                    duration=obj(value.get('duration'))
+                    nights=resolve(duration.get('nights',value.get('nights')))
+                    nights=int(nights) if isinstance(nights,(int,float)) and not isinstance(nights,bool) and nights==int(nights) and nights>=0 else None
                     ret = obj(value.get('anotherReturnAirport'))
                     item = dict(date=date, code=code, name=departure.get('title') or outbound.get('title') or code,
-                                price=amount / people, return_code=ret.get('id') or back or code,
+                                price=amount / people, nights=nights, days=resolve(duration.get('days')), end_date=value.get('endDate'), return_code=ret.get('id') or back or code,
                                 return_name=ret.get('title'), url=offer_url(url, code, token))
                     key = (date, code)
-                    if key not in found or amount / people < found[key]['price']: found[key] = item
+                    if nights is None or nights<6:
+                        item['exclusion_reason']='unknown_duration' if nights is None else 'short_stay'
+                        if key not in rejected or item['price']<rejected[key]['price']:rejected[key]=item
+                    elif key not in found or variant_rank(item,url)<variant_rank(found[key],url):
+                        found[key] = item
             for item in value.values(): walk(item)
     for value in nodes.values(): walk(value)
-    if not found: raise ValueError('ITAKA nie zwróciła wariantów z potwierdzonym lotniskiem i ceną.')
+    if not found and not (with_rejected and rejected): raise ValueError('ITAKA nie zwróciła wariantów z potwierdzonym lotniskiem i ceną.')
     variants = sorted(found.values(), key=lambda x: (x['date'], x['code']))
+    if with_rejected:
+        return variants,list(airports.values()),[item for key,item in rejected.items() if key not in found]
     return (variants, list(airports.values())) if with_airports else variants

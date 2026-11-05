@@ -10,7 +10,7 @@ def token(outbound, back):
 def html():
     poz=token('POZ','WAW');wro=token('WRO','KTW');ktw=token('KTW','KTW')
     def variant(code, back, date, total):
-        return dict(beginDate=date,departure=dict(id=code,title=code),
+        return dict(beginDate=date,duration=dict(days=8,nights=7),departure=dict(id=code,title=code),
                     participantGroups=[dict(id=token(code,back))],
                     price=dict(totalWithAdditionalPayments=dict(amount=total)))
     current=variant('POZ','WAW','2026-10-26',7858)
