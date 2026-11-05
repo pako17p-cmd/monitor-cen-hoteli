@@ -5,6 +5,10 @@ import re
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 
+class NoItakaVariants(ValueError):
+    pass
+
+
 def token_airports(token):
     """Offer protobuf fields 12 and 16 are outbound and return origin respectively."""
     try:
@@ -35,12 +39,21 @@ def token_airports(token):
         return None, None
 
 
-def offer_url(url, code, token):
+def offer_url(url, code, token, days=None):
     p = urlparse(url)
     query = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
-             if k != 'airports' and not k.startswith('id[')]
+             if k not in ('airports','duration') and not k.startswith('id[')]
+    if isinstance(days,int) and days>0:query.append(('duration',str(days)))
     query += [('airports', code), ('id[0]', token)]
     return urlunparse(p._replace(query=urlencode(query)))
+
+
+def duration_search_url(url,code,days=8):
+    """Ask for the duration before selecting an offer; an old id can pin a short stay."""
+    parts=urlparse(url)
+    query=[(k,v) for k,v in parse_qsl(parts.query,keep_blank_values=True)
+           if k not in ('airports','duration') and not k.startswith('id[')]
+    return urlunparse(parts._replace(query=urlencode(query+[('airports',code),('duration',str(days))])))
 
 
 def variant_rank(variant,url):
@@ -49,7 +62,7 @@ def variant_rank(variant,url):
     return preferred,variant['price']
 
 
-def parse_itaka_variants(html, url, people=2, with_airports=False, with_rejected=False):
+def parse_itaka_variants(html, url, people=2, with_airports=False, with_rejected=False, all_durations=False):
     chunks = []
     for match in re.finditer(r'self\.__next_f\.push\((\[.*?\])\)</script>', html, re.S):
         try:
@@ -113,17 +126,17 @@ def parse_itaka_variants(html, url, people=2, with_airports=False, with_rejected
                     ret = obj(value.get('anotherReturnAirport'))
                     item = dict(date=date, code=code, name=departure.get('title') or outbound.get('title') or code,
                                 price=amount / people, nights=nights, days=resolve(duration.get('days')), end_date=value.get('endDate'), return_code=ret.get('id') or back or code,
-                                return_name=ret.get('title'), url=offer_url(url, code, token))
-                    key = (date, code)
+                                return_name=ret.get('title'), url=offer_url(url, code, token, resolve(duration.get('days'))))
+                    key = (date, code, nights) if all_durations else (date, code)
                     if nights is None or nights<6:
                         item['exclusion_reason']='unknown_duration' if nights is None else 'short_stay'
-                        if key not in rejected or item['price']<rejected[key]['price']:rejected[key]=item
+                        if (date,code) not in rejected or item['price']<rejected[(date,code)]['price']:rejected[(date,code)]=item
                     elif key not in found or variant_rank(item,url)<variant_rank(found[key],url):
                         found[key] = item
             for item in value.values(): walk(item)
     for value in nodes.values(): walk(value)
-    if not found and not (with_rejected and rejected): raise ValueError('ITAKA nie zwróciła wariantów z potwierdzonym lotniskiem i ceną.')
+    if not found and not (with_rejected and rejected): raise NoItakaVariants('ITAKA nie zwróciła wariantów z potwierdzonym lotniskiem i ceną.')
     variants = sorted(found.values(), key=lambda x: (x['date'], x['code']))
     if with_rejected:
-        return variants,list(airports.values()),[item for key,item in rejected.items() if key not in found]
+        return variants,list(airports.values()),[item for key,item in rejected.items() if key not in {(v['date'],v['code']) for v in variants}]
     return (variants, list(airports.values())) if with_airports else variants

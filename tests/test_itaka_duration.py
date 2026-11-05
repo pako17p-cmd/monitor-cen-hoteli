@@ -1,6 +1,7 @@
 import json
 import unittest
-from itaka_data import parse_itaka_variants
+from itaka_data import parse_itaka_variants, duration_search_url
+from urllib.parse import parse_qs,urlparse
 
 def html(offers):
     stream='a:'+json.dumps(offers)+'\n'
@@ -30,5 +31,18 @@ class DurationTests(unittest.TestCase):
         valid,_,rejected=parse_itaka_variants(html([item]),'https://www.itaka.pl/hotel',with_rejected=True)
         self.assertEqual(valid,[])
         self.assertEqual(rejected[0]['exclusion_reason'],'unknown_duration')
+
+    def test_duration_search_unpins_old_offer_and_links_keep_actual_days(self):
+        url='https://www.itaka.pl/hotel?duration=5&id%5B0%5D=short&airports=POZ&adults%5B0%5D=2'
+        q=parse_qs(urlparse(duration_search_url(url,'WAW',8)).query)
+        self.assertNotIn('id[0]',q)
+        self.assertEqual(q['duration'],['8'])
+        self.assertEqual(q['airports'],['WAW'])
+        result=parse_itaka_variants(html([offer(14,12000)]),duration_search_url(url,'WAW',8))
+        self.assertEqual(parse_qs(urlparse(result[0]['url']).query)['duration'],['15'])
+
+    def test_all_durations_keeps_two_prices_for_same_date_and_airport(self):
+        result=parse_itaka_variants(html([offer(7,7000),offer(14,12000)]),'https://www.itaka.pl/hotel,PUJSERE/',all_durations=True)
+        self.assertEqual(sorted((v['nights'],v['price']) for v in result),[(7,3500),(14,6000)])
 
 if __name__=='__main__':unittest.main()

@@ -10,7 +10,8 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 import urllib.request
 from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 import github_state
-from itaka_data import parse_itaka_variants, token_airports, variant_rank
+import stay_history
+from itaka_data import parse_itaka_variants, token_airports, variant_rank, duration_search_url, NoItakaVariants
 from concurrent.futures import ThreadPoolExecutor
 
 app = Flask(__name__)
@@ -624,6 +625,7 @@ def connect():
         elif inferred_airport and row["airport_name"] in (None,"","Lotnisko z oferty"):
             con.execute("UPDATE hotels SET airport_name=? WHERE id=?",(inferred_airport,row["id"]))
     con.execute("CREATE TABLE IF NOT EXISTS prices(id INTEGER PRIMARY KEY,hotel_id INTEGER NOT NULL,checked_at TEXT NOT NULL,price REAL NOT NULL,FOREIGN KEY(hotel_id) REFERENCES hotels(id) ON DELETE CASCADE)")
+    stay_history.ensure_schema(con)
     price_columns={row[1] for row in con.execute("PRAGMA table_info(prices)").fetchall()}
     if "departure_date" not in price_columns: con.execute("ALTER TABLE prices ADD COLUMN departure_date TEXT")
     if "per_person" not in price_columns: con.execute("ALTER TABLE prices ADD COLUMN per_person INTEGER NOT NULL DEFAULT 0")
@@ -657,6 +659,7 @@ def state_from_database():
            "departures":[dict(row) for row in c.execute("SELECT hotel_id,airport_code,departure_date,last_seen_at,missing_checks,status,current_price,previous_price FROM tracked_departures_by_airport ORDER BY hotel_id,airport_code,departure_date")],
            "availability_events":[dict(row) for row in c.execute("SELECT id,hotel_id,airport_code,departure_date,checked_at,from_status,to_status,price,previous_price FROM availability_events ORDER BY id")],
            "updated_at":datetime.utcnow().replace(microsecond=0).isoformat()}
+    state.update(stay_history.export_state(c))
     c.close()
     return state
 
@@ -679,6 +682,7 @@ def sync_state_from_github():
     c=connect()
     try:
         c.execute("BEGIN IMMEDIATE")
+        stay_history.clear(c)
         c.execute("DELETE FROM availability_events")
         c.execute("DELETE FROM prices")
         c.execute("DELETE FROM tracked_departures_by_airport")
@@ -692,6 +696,7 @@ def sync_state_from_github():
                       [(d["hotel_id"],d.get("airport_code","DEFAULT"),d["departure_date"],d.get("last_seen_at"),d.get("missing_checks",0),d.get("status","available"),d.get("current_price"),d.get("previous_price")) for d in state.get("departures",[])])
         c.executemany("INSERT INTO availability_events(id,hotel_id,airport_code,departure_date,checked_at,from_status,to_status,price,previous_price) VALUES(?,?,?,?,?,?,?,?,?)",
                       [(e['id'],e['hotel_id'],e['airport_code'],e['departure_date'],e['checked_at'],e['from_status'],e['to_status'],e.get('price'),e.get('previous_price')) for e in state.get('availability_events',[])])
+        stay_history.restore(c,state)
         c.execute("INSERT OR IGNORE INTO tracked_departures(hotel_id,departure_date,last_seen_at,status) SELECT hotel_id,departure_date,MAX(checked_at),'available' FROM prices WHERE departure_date IS NOT NULL GROUP BY hotel_id,departure_date")
         c.execute("UPDATE tracked_departures SET current_price=(SELECT CASE WHEN p.per_person=1 THEN p.price ELSE p.price/h.people_count END FROM prices p JOIN hotels h ON h.id=p.hotel_id WHERE p.hotel_id=tracked_departures.hotel_id AND p.departure_date=tracked_departures.departure_date ORDER BY p.id DESC LIMIT 1) WHERE current_price IS NULL")
         c.commit()
@@ -1041,37 +1046,57 @@ def fetch_itaka_html(url):
 
 def check_itaka_hotel(hotel, max_departure):
     html=fetch_itaka_html(hotel['url'])
-    parsed=parse_itaka_variants(html,hotel['url'],hotel['people_count'],with_airports=True,with_rejected=True)
+    parsed=parse_itaka_variants(html,hotel['url'],hotel['people_count'],with_airports=True,with_rejected=True,all_durations=True)
     variants,available=parsed[:2]
     rejected=list(parsed[2]) if len(parsed)>2 else []
+    # A date-only result can expose just its cheapest short stay. Search again
+    # with the requested duration instead of excluding that departure entirely.
+    available=list({a['code']:a for a in available+[dict(code=v['code']) for v in rejected]}.values())
+    unconfirmed_lengths=set()
     def per_airport(option):
+        unknown=set()
         parts=urlparse(hotel['url'])
         query=[(k,v) for k,v in parse_qsl(parts.query,keep_blank_values=True) if k!='airports']
         target=urlunparse(parts._replace(query=urlencode(query+[("airports",option['code'])])))
         data=fetch_itaka_html(target)
-        parsed=parse_itaka_variants(data,target,hotel['people_count'],with_rejected=True)
+        parsed=parse_itaka_variants(data,target,hotel['people_count'],with_rejected=True,all_durations=True)
         if isinstance(parsed,tuple):
-            extra,_,excluded=parsed
+            extra=parsed[0];excluded=parsed[2] if len(parsed)>2 else []
         else:extra,excluded=parsed,[]
-        return [v for v in extra if v['code']==option['code']],[v for v in excluded if v['code']==option['code']]
+        extra=list(extra);excluded=list(excluded)
+        for days in (8,14,15):
+            requested_url=duration_search_url(hotel['url'],option['code'],days)
+            try:
+                result=parse_itaka_variants(fetch_itaka_html(requested_url),requested_url,hotel['people_count'],with_rejected=True,all_durations=True)
+            except NoItakaVariants:
+                unknown.add((option['code'],days))
+                app.logger.warning('ITAKA no confirmed variants: hotel %s, airport %s, requested days %s; keeping previous history',hotel['id'],option['code'],days)
+                continue
+            extra.extend(result[0]);excluded.extend(result[2])
+        return [v for v in extra if v['code']==option['code']],[v for v in excluded if v['code']==option['code']],unknown
     with ThreadPoolExecutor(max_workers=3) as pool:
-        for extra,excluded in pool.map(per_airport,available):
-            variants.extend(extra);rejected.extend(excluded)
+        for extra,excluded,unknown in pool.map(per_airport,available):
+            variants.extend(extra);rejected.extend(excluded);unconfirmed_lengths.update(unknown)
     best={}
     for v in variants:
-        key=(v['date'],v['code'])
+        key=(v['date'],v['code'],v.get('nights'))
         if key not in best or variant_rank(v,hotel['url'])<variant_rank(best[key],hotel['url']): best[key]=v
-    variants=list(best.values())
-    variants=[v for v in variants if v['date']<=max_departure]
+    all_variants=[v for v in best.values() if v['date']<=max_departure]
+    primary={}
+    for v in all_variants:
+        key=v['date'],v['code']
+        if key not in primary or variant_rank(v,hotel['url'])<variant_rank(primary[key],hotel['url']):primary[key]=v
+    variants=list(primary.values())
     seen={(v['date'],v['code']) for v in variants}
     rejected={(v['date'],v['code']):v for v in rejected if v['date']<=max_departure and (v['date'],v['code']) not in seen}
     if not variants and not rejected: raise ValueError("Brak potwierdzonych wariantów ITAKA w monitorowanym okresie.")
     stamp=datetime.utcnow().replace(microsecond=0).isoformat()
     by_date={}
-    for v in variants:
+    for v in sorted(all_variants,key=lambda v:variant_rank(v,hotel['url'])):
         by_date.setdefault(v['date'],dict(updated_at=stamp,airports=[]))['airports'].append(v)
     c=connect()
     try:
+        stay_history.record(c,hotel['id'],all_variants,stamp,max_departure,unconfirmed_lengths)
         cached=_decode_airport_options(c.execute("SELECT airport_options FROM hotels WHERE id=?",(hotel['id'],)).fetchone()[0])
         if not isinstance(cached,dict): cached={}
         prior_by_date={}

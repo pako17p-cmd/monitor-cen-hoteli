@@ -205,4 +205,31 @@ class SoldOutTests(unittest.TestCase):
             app.check_itaka_hotel(self.hotel(),self.limit)
         self.assertEqual(self.old_record()['status'],'excluded_duration')
 
+    def test_duration_search_restores_week_long_departure_instead_of_hiding_its_date(self):
+        c=app.connect();c.execute("UPDATE hotels SET url='https://www.itaka.pl/hotel,PUJSERE/?id%5B0%5D=old-short' WHERE id=1")
+        c.execute("UPDATE tracked_departures_by_airport SET status='excluded_duration' WHERE hotel_id=1")
+        c.commit();c.close()
+        short={**self.option,'nights':4,'exclusion_reason':'short_stay'}
+        week={**self.option,'nights':7,'days':8,'price':1600,'url':'https://www.itaka.pl/hotel,PUJSERE/?duration=8&id%5B0%5D=week'}
+        longer={**self.variant,'nights':14}
+        requested=[]
+        def download(url):
+            requested.append(url)
+            if 'duration=8' in url:
+                self.assertNotIn('old-short',url)
+                return 'weekly'
+            return 'default'
+        def parse(page,*args,**kwargs):
+            if page=='weekly':return ([week],[],[])
+            return ([longer],[{'code':'WAW'}],[short])
+        with patch.object(app,'fetch_itaka_html',side_effect=download),patch.object(app,'parse_itaka_variants',side_effect=parse):
+            app.check_itaka_hotel(self.hotel(),self.limit)
+        self.assertTrue(any('duration=8' in url for url in requested))
+        self.assertEqual(self.old_record()['status'],'available')
+        cache=json.loads(self.hotel()['airport_options'])
+        self.assertEqual(cache['by_date'][self.old]['airports'][0]['nights'],7)
+        self.assertEqual(cache['by_date'][self.new]['airports'][0]['nights'],14)
+        self.assertEqual(cache['excluded_by_date'],[])
+        self.assertEqual([p for p in app.state_from_database()['prices'] if p['departure_date']==self.old][-1]['price'],1600)
+
 if __name__=='__main__':unittest.main()
