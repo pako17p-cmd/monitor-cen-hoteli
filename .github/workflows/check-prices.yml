@@ -2,8 +2,8 @@ name: Check hotel prices
 
 on:
   schedule:
-    # Avoid the top of the hour, when GitHub schedule queues are busiest.
-    - cron: "17 */2 * * *"
+    # Check freshness every 15 minutes; retry overdue/failed checks until successful.
+    - cron: "7,22,37,52 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -16,12 +16,20 @@ concurrency:
 jobs:
   check-prices:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 15
     steps:
       - name: Check out application
         uses: actions/checkout@v4
 
+      - name: Check freshness and pending retries
+        id: freshness
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HISTORY_BRANCH: price-history
+        run: python3 price_check_guard.py check
+
       - name: Set up Python
+        if: steps.freshness.outputs.run == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -29,18 +37,22 @@ jobs:
           cache-dependency-path: requirements.txt
 
       - name: Install dependencies
+        if: steps.freshness.outputs.run == 'true'
         run: pip install -r requirements.txt
 
       - name: Install Chromium
+        if: steps.freshness.outputs.run == 'true'
         run: python -m playwright install chromium --only-shell
 
       - name: Test airport scraping and interface
+        if: steps.freshness.outputs.run == 'true'
         env:
           DISABLE_SCHEDULER: "1"
           DB_PATH: ${{ runner.temp }}/hotel-regression.db
         run: python -m unittest discover -s tests -p "test_*.py" -v
 
       - name: Read prices and save history
+        if: steps.freshness.outputs.run == 'true'
         env:
           DISABLE_SCHEDULER: "1"
           DB_PATH: ${{ runner.temp }}/hotel-history.db
@@ -48,6 +60,13 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           HISTORY_BRANCH: price-history
         run: python check_prices.py
+
+      - name: Confirm successful history update
+        if: success() && steps.freshness.outputs.run == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HISTORY_BRANCH: price-history
+        run: python3 price_check_guard.py success
 
       - name: Upload Rainbow failure screenshots
         if: always()
