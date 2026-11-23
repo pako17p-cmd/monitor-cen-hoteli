@@ -11,7 +11,7 @@ class RoomCountParserTests(unittest.TestCase):
     def test_missing_or_ambiguous_message_is_not_zero(self):
         self.assertIsNone(room_monitor.parse_room_count("Oferta jest dostępna"))
         self.assertIsNone(room_monitor.parse_room_count("Brak informacji o pokojach"))
-        self.assertIsNone(room_monitor.parse_room_count("Zostały 4 pokoje, a w innym miejscu 2 pokoje"))
+        self.assertIsNone(room_monitor.parse_room_count("Zostały 4 pokoje, a w innym miejscu pozostały 2 pokoje"))
     def test_state_round_trip_and_independent_settings(self):
         c=sqlite3.connect(":memory:")
         c.row_factory=sqlite3.Row
