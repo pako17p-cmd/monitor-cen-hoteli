@@ -8,6 +8,8 @@ import urllib.parse
 import github_state
 
 MARKER = 'price-check-status.json'
+REGULAR_CRON = '17 */2 * * *'
+RETRY_CRON = '7,22,37,52 * * * *'
 
 
 def parse_time(value):
@@ -17,9 +19,25 @@ def parse_time(value):
     return parsed.astimezone(timezone.utc)
 
 
-def should_check(state, now, manual=False):
+def should_check(state, now, manual=False, schedule=None):
     if manual:
         return True
+
+    # The dedicated 15-minute trigger must only retry a collection that
+    # started but has not been confirmed successful.
+    if schedule == RETRY_CRON:
+        try:
+            success = parse_time(state['successful_at'])
+            attempted = parse_time(state.get('attempted_at', state['successful_at']))
+            return attempted > success
+        except (KeyError, ValueError, TypeError, AttributeError):
+            return False
+
+    # The regular cron is the independent, authoritative two-hour trigger.
+    if schedule == REGULAR_CRON:
+        return True
+
+    # Push-triggered runs retain the freshness check and can recover overdue work.
     try:
         success = parse_time(state['successful_at'])
         attempted = parse_time(state.get('attempted_at', state['successful_at']))
@@ -65,15 +83,20 @@ def main():
     except Exception as exc:
         print(f'Cannot verify freshness; checking prices as a precaution: {exc}')
         state = {}
-    due = should_check(state, now, os.environ.get('GITHUB_EVENT_NAME') == 'workflow_dispatch')
+    due = should_check(
+        state,
+        now,
+        manual=os.environ.get('GITHUB_EVENT_NAME') == 'workflow_dispatch',
+        schedule=os.environ.get('SCHEDULE_CRON'),
+    )
     with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-        output.write(f'run={str(due).lower()}\n')
+        output.write(f'run={str(due).lower()}\\n')
     if due:
         # Persist before dependencies: install failures/timeouts also need a retry.
         write_marker('attempted_at', now.isoformat())
         print('Prices are due or previous attempt was unsuccessful; starting a check.')
     else:
-        print('Last full success is less than two hours old; no check needed.')
+        print('No failed attempt is pending; skipping this retry trigger.')
 
 
 if __name__ == '__main__':
