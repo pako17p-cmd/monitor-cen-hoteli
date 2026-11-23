@@ -92,7 +92,7 @@ def main():
         schedule=os.environ.get('SCHEDULE_CRON'),
     )
     with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-        output.write(f'run={str(due).lower()}\\n')
+        output.write(f'run={str(due).lower()}\n')
     if due:
         # Persist before dependencies: install failures/timeouts also need a retry.
         write_marker('attempted_at', now.isoformat())
