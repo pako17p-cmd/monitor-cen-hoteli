@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: hotel-price-check
+  group: hotel-price-check-${{ github.event_name }}
   cancel-in-progress: false
 
 jobs:
