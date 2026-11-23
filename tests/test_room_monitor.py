@@ -7,6 +7,7 @@ class RoomCountParserTests(unittest.TestCase):
         self.assertEqual(room_monitor.parse_room_count("<div>Zostały 4 pokoje!</div>"),4)
         self.assertEqual(room_monitor.parse_room_count("Pozostały tylko 2 pokoje"),2)
         self.assertEqual(room_monitor.parse_room_count("Został 1 pokój"),1)
+        self.assertEqual(room_monitor.parse_room_count('<span class="badge">4 OSTATNIE POKOJE</span>'),4)
     def test_missing_or_ambiguous_message_is_not_zero(self):
         self.assertIsNone(room_monitor.parse_room_count("Oferta jest dostępna"))
         self.assertIsNone(room_monitor.parse_room_count("Brak informacji o pokojach"))
