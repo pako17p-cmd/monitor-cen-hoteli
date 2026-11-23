@@ -61,6 +61,7 @@ def get_history(c,hotel_id,airport_code,departure_date,nights,limit=100):
 _ROOM_PATTERNS=(
     re.compile(r"\b(?:został(?:y|o)?|pozostał(?:y|o)?|dostępne\s+są|ostatnie|tylko)\s+(?:jeszcze\s+)?(?:tylko\s+)?(\d{1,3})\s+(?:pokój|pokoje|pokoi)\b",re.I),
     re.compile(r"\b(?:only|just)\s+(\d{1,3})\s+rooms?\s+(?:left|available)\b",re.I),
+    re.compile(r"\b(\d{1,3})\s+ostatnie\s+(?:pokój|pokoje|pokoi)\b",re.I),
 )
 
 def parse_room_count(source):
@@ -118,7 +119,7 @@ def run_checks(connect,fetch_html):
             FROM room_monitors m JOIN stay_offers s ON s.hotel_id=m.hotel_id AND s.airport_code=m.airport_code
               AND s.departure_date=m.departure_date AND s.nights=m.nights
             JOIN hotels t ON t.id=m.hotel_id
-            WHERE m.monitor_enabled=1 AND s.url IS NOT NULL AND s.url!='' AND s.departure_date>=date('now')
+            WHERE m.monitor_enabled=1 AND s.url IS NOT NULL AND s.url!='' AND lower(t.url) LIKE '%itaka.pl%' AND s.departure_date>=date('now')
             ORDER BY m.hotel_id,m.departure_date,m.nights""").fetchall()
     finally:c.close()
     checked=errors=0
