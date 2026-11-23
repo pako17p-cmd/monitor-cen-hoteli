@@ -4,7 +4,9 @@ on:
   push:
     branches: [main]
   schedule:
-    # Check freshness every 15 minutes; retry overdue/failed checks until successful.
+    # Regular price collection every two hours.
+    - cron: "17 */2 * * *"
+    # Retry only an unfinished/failed collection every 15 minutes.
     - cron: "7,22,37,52 * * * *"
   workflow_dispatch:
 
@@ -28,6 +30,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HISTORY_BRANCH: price-history
+          SCHEDULE_CRON: ${{ github.event.schedule }}
         run: python3 price_check_guard.py check
 
       - name: Set up Python
