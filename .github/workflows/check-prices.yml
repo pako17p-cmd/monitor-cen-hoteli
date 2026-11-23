@@ -61,7 +61,7 @@ jobs:
           HISTORY_BRANCH: price-history
           SMTP_USER: monitorcen4@gmail.com
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-          ROOM_ALERT_EMAIL: ${{ secrets.ROOM_ALERT_EMAIL }}
+          ROOM_ALERT_EMAIL: pako17p@gmail.com
         run: python check_prices.py
 
       - name: Confirm successful history update
