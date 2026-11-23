@@ -55,6 +55,7 @@ class AirportUiTests(unittest.TestCase):
         except Exception:
             print("DEBUG HOTELS TEXT:",self.page.locator("#hotels").inner_text())
             print("DEBUG HOTEL COUNT:",self.page.locator("article.hotel").count())
+            print("DEBUG SCRIPT PARSE:",self.page.evaluate("""() => { try { new Function(document.querySelector('script').textContent); return 'ok'; } catch(e) { return e.stack; } }"""))
             raise
 
     def tearDown(self):
