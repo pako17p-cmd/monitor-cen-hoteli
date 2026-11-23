@@ -46,7 +46,7 @@ class AirportUiTests(unittest.TestCase):
         ]
         self.posts=[]
         self.page=self.browser.new_page()
-        self.page.on("pageerror",lambda error: print("BROWSER PAGE ERROR:",error))
+        self.page.on("pageerror",lambda error: print("BROWSER PAGE ERROR:",error, getattr(error,"stack",None)))
         self.page.route("**/*",self.route)
         self.page.goto("http://hotel-test.local/")
         self.select=self.page.locator("article.hotel").nth(1).locator("select")
