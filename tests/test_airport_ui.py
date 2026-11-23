@@ -55,7 +55,7 @@ class AirportUiTests(unittest.TestCase):
         except Exception:
             print("DEBUG HOTELS TEXT:",self.page.locator("#hotels").inner_text())
             print("DEBUG HOTEL COUNT:",self.page.locator("article.hotel").count())
-            print("DEBUG SCRIPT PARSE:",self.page.evaluate("""() => { try { new Function(document.querySelector('script').textContent); return 'ok'; } catch(e) { return e.stack; } }"""))
+            print("DEBUG SCRIPT PARSE:",self.page.evaluate("""() => { const s=document.querySelector('script').textContent; const a=s.split(String.fromCharCode(10)); for(let i=0;i<a.length;i++){ try { new Function(a.slice(0,i+1).join(String.fromCharCode(10))); } catch(e) { if(!e.message.includes('Unexpected end')) return {line:i+1,error:e.message,source:a[i]}; } } return 'no line'; }"""))
             raise
 
     def tearDown(self):
