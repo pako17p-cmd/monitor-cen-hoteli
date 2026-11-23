@@ -1,6 +1,4 @@
 import base64, json, os, re, sqlite3, threading, time
-import http.client
-import socket
 from datetime import datetime, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
@@ -10,10 +8,6 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 import urllib.request
 from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 import github_state
-import stay_history
-import room_monitor
-from itaka_data import parse_itaka_variants, token_airports, variant_rank, duration_search_url, NoItakaVariants
-from concurrent.futures import ThreadPoolExecutor
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "please-change-this-secret-key")
@@ -175,48 +169,6 @@ def rainbow_calendar_target():
     month=month_index%12+1
     return f"{RAINBOW_MONTH_NAMES[f'{month:02d}']} {year}"
 
-class RainbowConfigurationUnavailable(Exception):
-    """The provider explicitly rejected this offer key, not the entire hotel."""
-    def __init__(self,url):
-        self.url=sanitize_rainbow_url(url)
-        super().__init__("Rainbow: oferta dostępna w innej konfiguracji")
-
-RAINBOW_UNAVAILABLE_PATTERN=re.compile(r"Oferta\s+dostępna\s+w\s+innej\s+konfiguracji",re.I)
-
-def wait_for_rainbow_configuration(page,url):
-    # Race both real outcomes: a sold-out configuration must not wait for a price.
-    page.get_by_text(re.compile(r"Cena\s+razem|Oferta\s+dostępna\s+w\s+innej\s+konfiguracji",re.I)).first.wait_for(state="visible",timeout=30000)
-    if page.get_by_text(RAINBOW_UNAVAILABLE_PATTERN).first.is_visible():
-        raise RainbowConfigurationUnavailable(url)
-
-def record_rainbow_unavailable(hotel,url):
-    """Resolve an exact saved offer key to a single departure and airport."""
-    def identity(value):
-        parts=urlparse(sanitize_rainbow_url(value))
-        key=dict(parse_qsl(parts.query)).get('unikalnyKluczOferty')
-        return (parts.hostname,parts.path.rstrip('/'),key) if key else None
-    target=identity(url)
-    cache=_decode_airport_options(hotel['airport_options'])
-    matches=set()
-    if target and isinstance(cache,dict):
-        for date,entry in cache.get('by_date',{}).items():
-            for option in entry.get('airports',[]):
-                if option.get('code') and identity(option.get('url',''))==target:
-                    matches.add((date,option['code']))
-    if len(matches)!=1:
-        raise ValueError('Nie można jednoznacznie przypisać niedostępnej konfiguracji Rainbow do terminu i lotniska.')
-    date,airport=matches.pop()
-    stamp=datetime.utcnow().replace(microsecond=0).isoformat()
-    c=connect()
-    try:
-        record_availability_transition(c,hotel['id'],airport,date,'unavailable',stamp)
-        c.execute("UPDATE tracked_departures_by_airport SET missing_checks=missing_checks+1,status='unavailable' WHERE hotel_id=? AND airport_code=? AND departure_date=?",(hotel['id'],airport,date))
-        c.execute("UPDATE hotels SET last_checked_at=? WHERE id=?",(stamp,hotel['id']))
-        c.commit()
-    finally:
-        c.close()
-    app.logger.info('Rainbow configuration unavailable: hotel %s, %s, %s',hotel['id'],date,airport)
-
 def fetch_rainbow_offer(url, people_count=2):
     """Retry one transient browser/consent failure in a fresh context."""
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -239,7 +191,10 @@ def _fetch_rainbow_offer_once(url, people_count=2):
         try:
             page=browser.new_page(locale="pl-PL",timezone_id="Europe/Warsaw")
             page.goto(safe_url,wait_until="domcontentloaded",timeout=60000)
-            wait_for_rainbow_configuration(page,safe_url)
+            try:
+                page.get_by_text(re.compile(r"Cena\s+razem",re.I)).first.wait_for(state="visible",timeout=30000)
+            except Exception:
+                page.locator("body").wait_for(state="visible",timeout=10000)
 
             dismiss_rainbow_cookie_overlay(page)
             # A second consent prompt can mount while the configurator loads.
@@ -275,8 +230,7 @@ def _fetch_rainbow_offer_once(url, people_count=2):
                     break
                 next_button.click()
                 collect_visible_calendar_prices()
-            calendar_complete=bool(target_prefix and any(date.startswith(target_prefix) for date in seen))
-            if not calendar_complete:
+            if target_prefix and not any(date.startswith(target_prefix) for date in seen):
                 app.logger.warning("Rainbow nie pokazało cen do miesiąca %s; zapisuję dostępne terminy",target_month)
             collect_visible_calendar_prices()
             calendar_prices=list(seen.items())
@@ -284,8 +238,6 @@ def _fetch_rainbow_offer_once(url, people_count=2):
                 samples=page.get_by_role("button").evaluate_all("""buttons => buttons.filter(b => /20\\d{2}/.test((b.getAttribute('aria-label')||'')+' '+(b.getAttribute('title')||'')+' '+(b.innerText||b.textContent||''))).slice(0,20).map(b => ({label:b.getAttribute('aria-label')||b.getAttribute('title')||'', text:b.innerText||b.textContent||''}))""")
                 app.logger.warning("Rainbow calendar sample buttons: %s",samples)
                 raise ValueError("Rainbow nie udostępniło cen w kalendarzu wyjazdów.")
-        except RainbowConfigurationUnavailable:
-            raise
         except Exception:
             save_rainbow_failure_debug(page,safe_url,"prices")
             raise
@@ -314,7 +266,7 @@ def _fetch_rainbow_offer_once(url, people_count=2):
     airport_name=airport_match.group(1).strip() if airport_match else "Lotnisko z oferty"
     airport_name=re.sub(r"\s+"," ",airport_name)
     airport_code="R-"+re.sub(r"[^A-Z0-9]+","-",airport_name.upper().replace("Ł","L").replace("Ó","O").replace("Ą","A").replace("Ę","E").replace("Ś","S").replace("Ć","C").replace("Ń","N").replace("Ż","Z").replace("Ź","Z")).strip("-")
-    return total,image_url,departure_date,calendar_prices,calendar_complete,airport_code,airport_name
+    return total,image_url,departure_date,calendar_prices,True,airport_code,airport_name
 
 def rainbow_airport_key(name):
     normalized=name.upper().replace("Ł","L").replace("Ó","O").replace("Ą","A").replace("Ę","E").replace("Ś","S").replace("Ć","C").replace("Ń","N").replace("Ż","Z").replace("Ź","Z")
@@ -478,7 +430,7 @@ def rainbow_airport_variants(url, departure_date=None, selected_code=None):
         try:
             page=browser.new_page(locale="pl-PL",timezone_id="Europe/Warsaw")
             page.goto(safe_url,wait_until="domcontentloaded",timeout=60000)
-            wait_for_rainbow_configuration(page,safe_url)
+            page.get_by_text(re.compile(r"Cena\s+razem",re.I)).first.wait_for(state="visible",timeout=30000)
             dismiss_rainbow_cookie_overlay(page)
             try:
                 page.locator('[id-dti="loader"]').wait_for(state="hidden",timeout=10000)
@@ -537,8 +489,6 @@ def rainbow_airport_variants(url, departure_date=None, selected_code=None):
                     page.wait_for_function("(previous)=>location.href!==previous",arg=before_select,timeout=30000)
                     page.get_by_role("button",name=re.compile(r"^\s*"+re.escape(option["name"])+r"\s+wylot",re.I)).first.wait_for(state="visible",timeout=20000)
             return {"url":sanitize_rainbow_url(page.url),"airports":airports}
-        except RainbowConfigurationUnavailable:
-            raise
         except Exception:
             save_rainbow_failure_debug(page,safe_url,str(departure_date or "airports"))
             raise
@@ -584,7 +534,7 @@ def country_from_url(url):
     path=urlparse(url).path.lower()
     if "wyspy-kanaryjskie" in path or "teneryfa" in path: return "Hiszpania"
     parts=[p for p in path.split("/") if p]
-    known={"madagaskar":"Madagaskar","grecja":"Grecja","hiszpania":"Hiszpania","turcja":"Turcja","egipt":"Egipt","włochy":"Włochy","wlochy":"Włochy","portugalia":"Portugalia","cypr":"Cypr","tunezja":"Tunezja","maroko":"Maroko","chorwacja":"Chorwacja","dominikana":"Dominikana","meksyk":"Meksyk","zanzibar":"Tanzania (Zanzibar)","kenia":"Kenia","malediwy":"Malediwy","maldives":"Malediwy","wyspy-zielonego-przyladka":"Republika Zielonego Przylądka"}
+    known={"madagaskar":"Madagaskar","grecja":"Grecja","hiszpania":"Hiszpania","turcja":"Turcja","egipt":"Egipt","włochy":"Włochy","wlochy":"Włochy","portugalia":"Portugalia","cypr":"Cypr","tunezja":"Tunezja","maroko":"Maroko","chorwacja":"Chorwacja","dominikana":"Dominikana","meksyk":"Meksyk","kenia":"Kenia","malediwy":"Malediwy","maldives":"Malediwy","wyspy-zielonego-przyladka":"Republika Zielonego Przylądka"}
     for part in parts:
         if part in known: return known[part]
     return "Kraj nieustalony"
@@ -594,11 +544,24 @@ def airport_code_from_url(url):
     query=parse_qsl(urlparse(url).query,keep_blank_values=True)
     direct=next((value.upper() for key,value in query if key.lower()=="airports"),"")
     if direct in AIRPORT_NAMES: return direct,AIRPORT_NAMES[direct]
-    # Read the outbound protobuf field; the return airport may be different.
+    # ITAKA embeds the selected departure airport in its base64-encoded id[0] offer key.
+    # Decode it before falling back to the generic label so existing seeded offers also
+    # display their airport when the page/API cannot be inspected.
     for key,value in query:
-        if key.lower().startswith("id") and value:
-            code,_=token_airports(value)
-            if code in AIRPORT_NAMES: return code,AIRPORT_NAMES[code]
+        if not key.lower().startswith("id") or not value: continue
+        candidates=[value]
+        try: candidates.append(unquote(value))
+        except Exception: pass
+        for candidate in candidates:
+            try:
+                token=candidate.strip()
+                token += "="*((4-len(token)%4)%4)
+                decoded=base64.urlsafe_b64decode(token.encode("ascii")).decode("latin1",errors="ignore").upper()
+            except Exception:
+                continue
+            for code in AIRPORT_NAMES:
+                if code in decoded:
+                    return code,AIRPORT_NAMES[code]
     return "DEFAULT","Lotnisko z oferty"
 
 def connect():
@@ -626,27 +589,21 @@ def connect():
         elif inferred_airport and row["airport_name"] in (None,"","Lotnisko z oferty"):
             con.execute("UPDATE hotels SET airport_name=? WHERE id=?",(inferred_airport,row["id"]))
     con.execute("CREATE TABLE IF NOT EXISTS prices(id INTEGER PRIMARY KEY,hotel_id INTEGER NOT NULL,checked_at TEXT NOT NULL,price REAL NOT NULL,FOREIGN KEY(hotel_id) REFERENCES hotels(id) ON DELETE CASCADE)")
-    stay_history.ensure_schema(con)
-    room_monitor.ensure_schema(con)
     price_columns={row[1] for row in con.execute("PRAGMA table_info(prices)").fetchall()}
     if "departure_date" not in price_columns: con.execute("ALTER TABLE prices ADD COLUMN departure_date TEXT")
     if "per_person" not in price_columns: con.execute("ALTER TABLE prices ADD COLUMN per_person INTEGER NOT NULL DEFAULT 0")
     if "airport_code" not in price_columns: con.execute("ALTER TABLE prices ADD COLUMN airport_code TEXT NOT NULL DEFAULT 'DEFAULT'")
     con.execute("CREATE TABLE IF NOT EXISTS tracked_departures_by_airport(hotel_id INTEGER NOT NULL,airport_code TEXT NOT NULL,departure_date TEXT NOT NULL,last_seen_at TEXT,missing_checks INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'available',current_price REAL,previous_price REAL,PRIMARY KEY(hotel_id,airport_code,departure_date),FOREIGN KEY(hotel_id) REFERENCES hotels(id) ON DELETE CASCADE)")
-    con.execute("CREATE TABLE IF NOT EXISTS availability_events(id INTEGER PRIMARY KEY,hotel_id INTEGER NOT NULL,airport_code TEXT NOT NULL,departure_date TEXT NOT NULL,checked_at TEXT NOT NULL,from_status TEXT NOT NULL,to_status TEXT NOT NULL,price REAL,previous_price REAL,UNIQUE(hotel_id,airport_code,departure_date,checked_at,to_status),FOREIGN KEY(hotel_id) REFERENCES hotels(id) ON DELETE CASCADE)")
     con.execute("CREATE TABLE IF NOT EXISTS tracked_departures(hotel_id INTEGER NOT NULL,departure_date TEXT NOT NULL,last_seen_at TEXT,missing_checks INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'available',PRIMARY KEY(hotel_id,departure_date),FOREIGN KEY(hotel_id) REFERENCES hotels(id) ON DELETE CASCADE)")
     departure_columns={row[1] for row in con.execute("PRAGMA table_info(tracked_departures)").fetchall()}
     if "current_price" not in departure_columns: con.execute("ALTER TABLE tracked_departures ADD COLUMN current_price REAL")
     if "previous_price" not in departure_columns: con.execute("ALTER TABLE tracked_departures ADD COLUMN previous_price REAL")
     # Attribute legacy history to each hotel's currently selected airport on migration.
-    for hotel in con.execute("SELECT id,url,airport_code,airport_name,country,airport_options FROM hotels").fetchall():
+    for hotel in con.execute("SELECT id,url,airport_code,airport_name,country FROM hotels").fetchall():
         code,name=airport_code_from_url(hotel["url"])
         con.execute("UPDATE hotels SET airport_code=CASE WHEN airport_code='DEFAULT' THEN ? ELSE airport_code END,airport_name=CASE WHEN airport_name='Lotnisko z oferty' THEN ? ELSE airport_name END,country=CASE WHEN country='Kraj nieustalony' THEN ? ELSE country END WHERE id=?",(code,name,country_from_url(hotel["url"]),hotel["id"]))
         con.execute("UPDATE prices SET airport_code=? WHERE hotel_id=? AND airport_code='DEFAULT'",(code,hotel["id"]))
-        try: structured=json.loads(hotel["airport_options"]).get("version")==2
-        except (ValueError,AttributeError,TypeError): structured=False
-        if not structured:
-            con.execute("INSERT OR IGNORE INTO tracked_departures_by_airport(hotel_id,airport_code,departure_date,last_seen_at,missing_checks,status,current_price,previous_price) SELECT hotel_id,?,departure_date,last_seen_at,missing_checks,status,current_price,previous_price FROM tracked_departures WHERE hotel_id=?",(code,hotel["id"]))
+        con.execute("INSERT OR IGNORE INTO tracked_departures_by_airport(hotel_id,airport_code,departure_date,last_seen_at,missing_checks,status,current_price,previous_price) SELECT hotel_id,?,departure_date,last_seen_at,missing_checks,status,current_price,previous_price FROM tracked_departures WHERE hotel_id=?",(code,hotel["id"]))
     con.execute("INSERT OR IGNORE INTO tracked_departures(hotel_id,departure_date,last_seen_at,status) SELECT hotel_id,departure_date,MAX(checked_at),'available' FROM prices WHERE departure_date IS NOT NULL GROUP BY hotel_id,departure_date")
     con.execute("UPDATE tracked_departures SET current_price=(SELECT CASE WHEN p.per_person=1 THEN p.price ELSE p.price/h.people_count END FROM prices p JOIN hotels h ON h.id=p.hotel_id WHERE p.hotel_id=tracked_departures.hotel_id AND p.departure_date=tracked_departures.departure_date ORDER BY p.id DESC LIMIT 1) WHERE current_price IS NULL")
     if fresh_database and con.execute("SELECT COUNT(*) FROM hotels").fetchone()[0]==0: con.executemany("INSERT INTO hotels(name,url) VALUES(?,?)",SEEDS)
@@ -659,10 +616,7 @@ def state_from_database():
     state={"hotels":[dict(row) for row in c.execute("SELECT id,name,url,people_count,image_url,last_checked_at,country,airport_code,airport_name,airport_options FROM hotels ORDER BY id")],
            "prices":[dict(row) for row in c.execute("SELECT id,hotel_id,checked_at,price,departure_date,per_person,airport_code FROM prices ORDER BY id")],
            "departures":[dict(row) for row in c.execute("SELECT hotel_id,airport_code,departure_date,last_seen_at,missing_checks,status,current_price,previous_price FROM tracked_departures_by_airport ORDER BY hotel_id,airport_code,departure_date")],
-           "availability_events":[dict(row) for row in c.execute("SELECT id,hotel_id,airport_code,departure_date,checked_at,from_status,to_status,price,previous_price FROM availability_events ORDER BY id")],
            "updated_at":datetime.utcnow().replace(microsecond=0).isoformat()}
-    state.update(stay_history.export_state(c))
-    state.update(room_monitor.export_state(c))
     c.close()
     return state
 
@@ -685,9 +639,6 @@ def sync_state_from_github():
     c=connect()
     try:
         c.execute("BEGIN IMMEDIATE")
-        stay_history.clear(c)
-        room_monitor.clear(c)
-        c.execute("DELETE FROM availability_events")
         c.execute("DELETE FROM prices")
         c.execute("DELETE FROM tracked_departures_by_airport")
         c.execute("DELETE FROM tracked_departures")
@@ -698,10 +649,6 @@ def sync_state_from_github():
                       [(p["id"],p["hotel_id"],p["checked_at"],p["price"],p.get("departure_date"),p.get("per_person",0),p.get("airport_code") or "DEFAULT") for p in state["prices"]])
         c.executemany("INSERT INTO tracked_departures_by_airport(hotel_id,airport_code,departure_date,last_seen_at,missing_checks,status,current_price,previous_price) VALUES(?,?,?,?,?,?,?,?)",
                       [(d["hotel_id"],d.get("airport_code","DEFAULT"),d["departure_date"],d.get("last_seen_at"),d.get("missing_checks",0),d.get("status","available"),d.get("current_price"),d.get("previous_price")) for d in state.get("departures",[])])
-        c.executemany("INSERT INTO availability_events(id,hotel_id,airport_code,departure_date,checked_at,from_status,to_status,price,previous_price) VALUES(?,?,?,?,?,?,?,?,?)",
-                      [(e['id'],e['hotel_id'],e['airport_code'],e['departure_date'],e['checked_at'],e['from_status'],e['to_status'],e.get('price'),e.get('previous_price')) for e in state.get('availability_events',[])])
-        stay_history.restore(c,state)
-        room_monitor.restore(c,state)
         c.execute("INSERT OR IGNORE INTO tracked_departures(hotel_id,departure_date,last_seen_at,status) SELECT hotel_id,departure_date,MAX(checked_at),'available' FROM prices WHERE departure_date IS NOT NULL GROUP BY hotel_id,departure_date")
         c.execute("UPDATE tracked_departures SET current_price=(SELECT CASE WHEN p.per_person=1 THEN p.price ELSE p.price/h.people_count END FROM prices p JOIN hotels h ON h.id=p.hotel_id WHERE p.hotel_id=tracked_departures.hotel_id AND p.departure_date=tracked_departures.departure_date ORDER BY p.id DESC LIMIT 1) WHERE current_price IS NULL")
         c.commit()
@@ -735,16 +682,14 @@ def logout(): session.clear(); return redirect("/login")
 
 PAGE='''<!doctype html><html lang="pl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#123f50"><title>Ceny hoteli</title><style>
 :root{--ink:#153a43;--muted:#75858c;--teal:#138274;--bg:#f2f6f5;--line:#e6eceb}*{box-sizing:border-box}body{margin:0;background:#f7f5f0;color:var(--ink);font:15px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}header{position:relative;isolation:isolate;overflow:hidden;text-align:center;color:#fff;min-height:190px;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:calc(26px + env(safe-area-inset-top)) 18px 34px;background:#087b91 url("/assets/background.webp") center 52%/cover no-repeat}header:after{content:"";position:absolute;z-index:-1;left:-5%;right:-5%;height:44px;bottom:-22px;border-radius:50% 50% 0 0/100% 100% 0 0;background:#f7f5f0;opacity:.96}header h1{margin:0 0 4px;line-height:0}header h1 img{display:block;width:min(360px,78vw);height:auto;max-height:96px;object-fit:contain}header p{margin:5px 0 0;color:#fff;font-size:14px;text-shadow:0 1px 5px #073746aa}.wrap{max-width:1300px;padding:18px 22px;margin:-20px auto 0;position:relative}.actions{display:flex;gap:9px;flex-wrap:wrap;margin-bottom:14px}button{border:0;border-radius:11px;padding:12px 15px;font:600 14px inherit;cursor:pointer}.primary{background:var(--teal);color:white}.secondary{background:#fff;color:var(--ink);box-shadow:0 1px 3px #102f3612}.danger{color:#a53943;background:transparent}.history-btn{background:#eef7fc;color:#0878a6}.offer-btn{background:#148879;color:#fff;box-shadow:0 2px 6px #12827426}.delete-btn{background:#fff0ef;color:#c83232}.terms-btn{background:#f1f7f7;color:#226b72}.departure-choice{background:#fff;border:1px solid var(--line);color:var(--ink);padding:9px 12px;border-radius:10px}.departures{display:none;grid-column:1/-1;padding:12px 0 2px;gap:8px;flex-wrap:wrap}.departures.show{display:flex}.departure-choice.active{border-color:#148879;background:#eef8f5;color:#08786e;font-weight:700}.card{background:white;border:1px solid var(--line);border-radius:16px;padding:16px;margin:12px 0;box-shadow:0 4px 14px #173d3c08}.card h2{font-size:17px;margin:0 0 12px}.hotel{display:grid;grid-template-columns:82px minmax(0,1fr);column-gap:14px;align-items:center;padding:14px 0;border-top:1px solid var(--line);cursor:pointer}.hotel:first-of-type{border:0}.thumb{width:82px;height:82px;object-fit:cover;border-radius:12px;background:#dff0ed;grid-row:1 / span 2}.thumb.missing{display:grid;place-items:center;color:#fff;font-size:25px;background:linear-gradient(140deg,#f3cf8c,#78c4bd 55%,#347f96)}.hotelname{font-weight:700}.price{font-size:21px;font-weight:750;color:#08786e;white-space:nowrap}.pricebox{background:#eef8f5;border-radius:12px;padding:12px 15px;text-align:center}.airport-label{margin-top:4px;color:#176f70}.airport-select{margin-top:7px;max-width:260px;padding:7px 10px;border:1px solid #c9ded9;border-radius:9px;background:#f7fbfa;color:#15344a;font:inherit;font-size:13px;cursor:pointer}.airport-select:focus{outline:2px solid #148477;outline-offset:1px}.meta{color:var(--muted);font-size:12px;margin-top:5px}.rowbuttons{display:flex;gap:8px;align-items:center;margin-top:8px;grid-column:2/-1}.small{padding:8px 10px;font-size:12px}.chartwrap{height:230px}canvas{width:100%;height:100%}.tablewrap{overflow:auto}table{border-collapse:collapse;width:100%;font-size:13px}td,th{text-align:left;padding:11px 8px;border-bottom:1px solid var(--line);white-space:nowrap}th{color:var(--muted);font-weight:600}.note{font-size:12px;color:var(--muted);line-height:1.5}.modal{position:fixed;inset:0;background:#0e293b78;display:none;place-items:center;padding:18px}.modal.show{display:grid}.dialog{background:white;border-radius:18px;padding:22px;width:min(100%,430px)}.dialog h2{margin-top:0}.dialog input{width:100%;padding:12px;border:1px solid #cbd7d5;border-radius:10px;margin:6px 0 12px;font:inherit}.dialog label{font-size:13px;font-weight:650}.dialog .actions{margin:8px 0 0}.empty{color:var(--muted);padding:12px 0}.status{font-size:12px;color:var(--muted);margin-left:auto;align-self:center}@media(min-width:780px){.columns{display:grid;grid-template-columns:1fr 1fr;gap:14px}.columns .card{margin:0}.hotel{grid-template-columns:200px minmax(0,1fr) 270px;column-gap:22px;min-height:130px;padding:15px 0}.thumb{width:200px;height:112px;grid-row:1 / span 2}.hotel .rowbuttons{grid-column:2/-1;margin-top:12px}.chartwrap{height:260px}}
-.insight-grid{display:grid;grid-template-columns:1fr;gap:10px}.insight{background:#f7faf9;border:1px solid var(--line);border-radius:12px;padding:14px;min-width:0}.insight span,.insight small{display:block;color:var(--muted);font-size:12px}.insight strong{display:block;margin:8px 0 4px;color:#08786e;font-size:16px;line-height:1.45}.insight.muted{color:var(--muted)}.room-monitor-list{flex-basis:100%;width:100%;border-top:1px solid var(--line);margin-top:12px;padding-top:10px}.room-monitor-heading{font-size:13px;font-weight:700;margin-bottom:8px}.room-monitor-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:9px 0;border-bottom:1px solid var(--line);font-size:12px}.room-monitor-info{min-width:180px;flex:1}.room-monitor-info b,.room-monitor-info span{display:block}.room-monitor-info span{color:var(--muted);margin-top:3px}.room-monitor-row label{display:inline-flex;align-items:center;gap:5px;white-space:nowrap;cursor:pointer}.room-monitor-row input{accent-color:#138274}.room-history-btn{background:#eef7fc;color:#0878a6;padding:6px 9px;font-size:11px}.departure-choice.inactive{background:#f0f1f1;color:#7b8588;border-color:#e2e5e5}.departure-choice.inactive.active{border-color:#8d999c}.term-status{margin-left:9px;font-size:11px;color:#788285}.best-badge{margin-left:9px;border-radius:20px;background:#ddf3e9;color:#08786e;padding:3px 8px;font-size:11px}@media(min-width:780px){.insight-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}</style></head><body><header><h1><img src="/assets/napis.png" alt="Ceny hoteli"></h1><p>Historia ofert ITAKA · {{ "automatycznie co 2 godziny" if auto_check_enabled else "test · odczyt ręczny" }}</p></header><main class="wrap"><div class="actions"><button class="primary" onclick="openAdd()">＋ Dodaj hotel</button><button class="secondary" id="check" onclick="checkNow()">Sprawdź teraz</button><span class="status" id="status">Gotowe</span></div><section class="card"><h2>Monitorowane oferty</h2><div id="hotels"></div></section><section class="card"><h2>Analiza wybranego terminu</h2><div id="insights" class="insight-grid"></div></section><div class="columns"><section class="card"><h2>Wykres ceny za osobę</h2><div class="chartwrap"><canvas id="chart"></canvas></div><div class="meta" id="chartname">Wybierz hotel</div></section><section class="card"><h2>Historia odczytów</h2><div class="tablewrap"><table><thead><tr><th>Data i godzina</th><th>Cena / osoba</th><th>Zmiana / osoba</th></tr></thead><tbody id="history"></tbody></table></div><div class="empty" id="nohistory" hidden>Brak odczytów. Użyj „Sprawdź teraz”.</div></section></div><p class="note">Cena za osobę to łączna cena oferty podzielona przez liczbę podróżnych. Przy dodawaniu hotelu wpisz ich liczbę. Link do ITAKA lub Rainbow powinien zawierać wybrany termin i parametry wyjazdu. Dla Rainbow aplikacja zapamiętuje link do wybranej oferty bez dat urodzenia w parametrach.</p></main>
+.insight-grid{display:grid;grid-template-columns:1fr;gap:10px}.insight{background:#f7faf9;border:1px solid var(--line);border-radius:12px;padding:14px;min-width:0}.insight span,.insight small{display:block;color:var(--muted);font-size:12px}.insight strong{display:block;margin:8px 0 4px;color:#08786e;font-size:16px;line-height:1.45}.insight.muted{color:var(--muted)}.departure-choice.inactive{background:#f0f1f1;color:#7b8588;border-color:#e2e5e5}.departure-choice.inactive.active{border-color:#8d999c}.term-status{margin-left:9px;font-size:11px;color:#788285}.best-badge{margin-left:9px;border-radius:20px;background:#ddf3e9;color:#08786e;padding:3px 8px;font-size:11px}@media(min-width:780px){.insight-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}</style></head><body><header><h1><img src="/assets/napis.png" alt="Ceny hoteli"></h1><p>Historia ofert ITAKA · {{ "automatycznie co 2 godziny" if auto_check_enabled else "test · odczyt ręczny" }}</p></header><main class="wrap"><div class="actions"><button class="primary" onclick="openAdd()">＋ Dodaj hotel</button><button class="secondary" id="check" onclick="checkNow()">Sprawdź teraz</button><span class="status" id="status">Gotowe</span></div><section class="card"><h2>Monitorowane oferty</h2><div id="hotels"></div></section><section class="card"><h2>Analiza wybranego terminu</h2><div id="insights" class="insight-grid"></div></section><div class="columns"><section class="card"><h2>Wykres ceny za osobę</h2><div class="chartwrap"><canvas id="chart"></canvas></div><div class="meta" id="chartname">Wybierz hotel</div></section><section class="card"><h2>Historia odczytów</h2><div class="tablewrap"><table><thead><tr><th>Data i godzina</th><th>Cena / osoba</th><th>Zmiana / osoba</th></tr></thead><tbody id="history"></tbody></table></div><div class="empty" id="nohistory" hidden>Brak odczytów. Użyj „Sprawdź teraz”.</div></section></div><p class="note">Cena za osobę to łączna cena oferty podzielona przez liczbę podróżnych. Przy dodawaniu hotelu wpisz ich liczbę. Link do ITAKA lub Rainbow powinien zawierać wybrany termin i parametry wyjazdu. Dla Rainbow aplikacja zapamiętuje link do wybranej oferty bez dat urodzenia w parametrach.</p></main>
 <div class="modal" id="modal"><form class="dialog" onsubmit="addHotel(event)"><h2>Dodaj ofertę</h2><label>Nazwa hotelu<input name="name" required placeholder="np. Hotel nad morzem"></label><label>Pełny link do oferty ITAKA lub Rainbow<input name="url" type="url" required placeholder="https://www.itaka.pl/... lub https://r.pl/..."></label><label>Liczba podróżnych<input name="people_count" type="number" min="1" max="20" value="2" required></label><div class="actions"><button type="button" class="secondary" onclick="closeAdd()">Anuluj</button><button class="primary">Zapisz hotel</button></div></form></div>
 <script>
 let hotels=[], selected=null, hist=[], insights=null, selectedDate=null, expandedHotels=new Set(); const $=s=>document.querySelector(s); const money=v=>new Intl.NumberFormat('pl-PL',{style:'currency',currency:'PLN',maximumFractionDigits:2}).format(v); const date=s=>new Date(s+'Z').toLocaleString('pl-PL',{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'}); const dateOnly=s=>s?new Date(s+'T00:00:00').toLocaleDateString('pl-PL'):'—';
 async function api(path,opt={}){let r=await fetch('/api/'+path,{headers:{'Content-Type':'application/json'},...opt});if(r.status===401){location='/login';throw Error('Zaloguj się ponownie.')}let d=await r.json();if(!r.ok)throw Error(d.error||'Wystąpił błąd');return d}
 async function load(){try{let d=await api('hotels');hotels=d.hotels;if(!selected||!hotels.some(h=>h.id===selected)){selected=hotels[0]?.id||null;selectedDate=hotels[0]?.offers?.[0]?.date||hotels[0]?.departure_date||null}else{let h=hotels.find(x=>x.id===selected);if(!selectedDate||(!h?.offers?.some(o=>o.date===selectedDate)&&h?.offers?.length))selectedDate=h?.offers?.[0]?.date||h?.departure_date||null}drawHotels();await loadHistory()}catch(e){status(e.message,true)}}
 function status(t,bad=false){$('#status').textContent=t;$('#status').style.color=bad?'#b42318':''}
-function drawHotels(){let root=$('#hotels');if(!hotels.length){root.innerHTML='<div class="empty">Dodaj hotel, aby rozpocząć monitorowanie.</div>';return}root.innerHTML=hotels.map(h=>{let chosenDate=selected===h.id&&selectedDate?h.offers.find(o=>o.date===selectedDate):null;let shownDate=(selected===h.id&&selectedDate)||h.departure_date;let airportOptions=h.airport_options_by_date?.[shownDate]||h.airport_options||[];let shownPrice=chosenDate?.price??h.price;let shownTotal=shownPrice===null?null:shownPrice*h.people_count;let active=h.offers.filter(o=>o.status==='available');let cheapest=active.length?Math.min(...active.map(o=>o.price)):null;return `<article class="hotel" onclick="selectHotel(${h.id})">${h.image_url?`<img class="thumb" src="${esc(h.image_url)}" alt="" loading="lazy" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'thumb missing',textContent:'🏝️'}))">`:`<div class="thumb missing">🏝️</div>`}<div><div class="hotelname">${esc(h.name)}</div><div class="meta">${esc(h.country||'Kraj nieustalony')} · ${h.people_count} os. · Wylot: ${dateOnly(shownDate)} · ${h.checked?`Ostatni odczyt: ${date(h.checked)}`:'Oczekuje na pierwszy odczyt'}</div><div class="meta airport-label">Lotnisko: ${esc(h.airport_name||'Lotnisko z oferty')}</div>${airportOptions.length>1?`<select class="airport-select" onclick="event.stopPropagation()" onchange="changeAirport(${h.id},this.value,'${shownDate||''}')"><option value="">Zmień lotnisko…</option>${airportOptions.map(o=>`<option value="${esc(o.code)}" ${o.code===h.airport_code?'selected':''}>${esc(o.name)}</option>`).join('')}</select>`:''}</div><div class="pricebox"><div class="price">${shownPrice===null?'—':money(shownPrice)} / os.</div>${shownTotal===null?'':`<div class="meta">Łącznie: ${money(shownTotal)}</div>`}</div><div class="rowbuttons"><button class="history-btn small" onclick="event.stopPropagation();selectHotel(${h.id},'${shownDate||''}')">Historia</button><button class="offer-btn small" onclick="event.stopPropagation();window.open('${esc(h.url)}','_blank')">Otwórz ofertę</button><button class="delete-btn small" onclick="event.stopPropagation();removeHotel(${h.id})">Usuń</button><button class="terms-btn small" onclick="event.stopPropagation();toggleDates(${h.id})">Terminy i ceny (${h.offers.length})</button></div><div class="departures ${expandedHotels.has(h.id)?'show':''}">${h.offers.length?h.offers.map(o=>{let inactive=o.status!=='available';return `<button class="departure-choice ${inactive?'inactive ':''}${selected===h.id&&selectedDate===o.date?'active':''}" onclick="event.stopPropagation();selectHotel(${h.id},'${o.date}')"><span>${inactive?`<s>Wylot ${dateOnly(o.date)} · ${money(o.price)} / os.</s>`:`Wylot ${dateOnly(o.date)} · ${money(o.price)} / os.`}</span>${o.status==='expired'?'<span class="term-status">Termin minął</span>':o.status==='unavailable'?'<span class="term-status">Oferta niedostępna</span>':''}${!inactive&&o.price===cheapest?'<span class="best-badge">Najtaniej</span>':''}</button>`}).join(''):'<span class="meta">Kalendarz terminów będzie dostępny po odczycie ITAKA.</span>'}${h.stays?.length?`<div class="room-monitor-list"><div class="room-monitor-heading">Monitorowanie liczby pokoi — osobno dla każdego pobytu</div>${h.stays.map(s=>`<div class="room-monitor-row"><div class="room-monitor-info"><b>Wylot ${dateOnly(s.departure_date)} · ${s.nights} nocy · ${esc(s.airport_code)}</b><span>${s.last_count===null?'Brak poprawnego odczytu':`Ostatnio: ${s.last_count} ${s.last_count===1?'pokój':s.last_count>=2&&s.last_count<=4?'pokoje':'pokoi'}`} ${s.last_checked_at?'· '+date(s.last_checked_at):''}</span></div><label onclick="event.stopPropagation()"><input type="checkbox" ${s.monitor_enabled?'checked':''} onchange="updateRoomMonitor(${h.id},'${esc(s.airport_code)}','${s.departure_date}',${s.nights},'monitor',this.checked)"> Monitoruj pokoje</label><label onclick="event.stopPropagation()"><input type="checkbox" ${s.email_enabled?'checked':''} onchange="updateRoomMonitor(${h.id},'${esc(s.airport_code)}','${s.departure_date}',${s.nights},'email',this.checked)"> E-mail</label><button class="room-history-btn" onclick="event.stopPropagation();showRoomHistory(${h.id},'${esc(s.airport_code)}','${s.departure_date}',${s.nights})">Historia</button></div>`).join('')}</div>`:''}</div></article>`}).join('')}
-async function updateRoomMonitor(id,airport,dateValue,nights,field,value){let h=hotels.find(x=>x.id===id),s=h?.stays?.find(x=>x.airport_code===airport&&x.departure_date===dateValue&&x.nights===nights);if(!s)return;let body={airport_code:airport,departure_date:dateValue,nights,monitor_enabled:field==='monitor'?value:s.monitor_enabled,email_enabled:field==='email'?value:s.email_enabled};try{await api(\`hotels/\${id}/room-monitor\`,{method:'POST',body:JSON.stringify(body)});status('Zapisano ustawienia monitorowania pokoi');await load()}catch(e){status(e.message,true);await load()}}
-async function showRoomHistory(id,airport,dateValue,nights){try{let q=new URLSearchParams({airport,date:dateValue,nights:String(nights)}),d=await api(\`hotels/\${id}/room-monitor/history?\${q}\`);let lines=d.history.map(x=>\`\${date(x.checked_at)} — \${x.room_count} pokoi\`).join('\n');alert(lines||'Brak zapisanych odczytów dla tego pobytu.')}catch(e){status(e.message,true)}}
+function drawHotels(){let root=$('#hotels');if(!hotels.length){root.innerHTML='<div class="empty">Dodaj hotel, aby rozpocząć monitorowanie.</div>';return}root.innerHTML=hotels.map(h=>{let chosenDate=selected===h.id&&selectedDate?h.offers.find(o=>o.date===selectedDate):null;let shownDate=(selected===h.id&&selectedDate)||h.departure_date;let airportOptions=h.airport_options_by_date?.[shownDate]||h.airport_options||[];let shownPrice=chosenDate?.price??h.price;let shownTotal=shownPrice===null?null:shownPrice*h.people_count;let active=h.offers.filter(o=>o.status==='available');let cheapest=active.length?Math.min(...active.map(o=>o.price)):null;return `<article class="hotel" onclick="selectHotel(${h.id})">${h.image_url?`<img class="thumb" src="${esc(h.image_url)}" alt="" loading="lazy" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'thumb missing',textContent:'🏝️'}))">`:`<div class="thumb missing">🏝️</div>`}<div><div class="hotelname">${esc(h.name)}</div><div class="meta">${esc(h.country||'Kraj nieustalony')} · ${h.people_count} os. · Wylot: ${dateOnly(shownDate)} · ${h.checked?`Ostatni odczyt: ${date(h.checked)}`:'Oczekuje na pierwszy odczyt'}</div><div class="meta airport-label">Lotnisko: ${esc(h.airport_name||'Lotnisko z oferty')}</div>${airportOptions.length>1?`<select class="airport-select" onclick="event.stopPropagation()" onchange="changeAirport(${h.id},this.value,'${shownDate||''}')"><option value="">Zmień lotnisko…</option>${airportOptions.map(o=>`<option value="${esc(o.code)}" ${o.code===h.airport_code?'selected':''}>${esc(o.name)}</option>`).join('')}</select>`:''}</div><div class="pricebox"><div class="price">${shownPrice===null?'—':money(shownPrice)} / os.</div>${shownTotal===null?'':`<div class="meta">Łącznie: ${money(shownTotal)}</div>`}</div><div class="rowbuttons"><button class="history-btn small" onclick="event.stopPropagation();selectHotel(${h.id},'${shownDate||''}')">Historia</button><button class="offer-btn small" onclick="event.stopPropagation();window.open('${esc(h.url)}','_blank')">Otwórz ofertę</button><button class="delete-btn small" onclick="event.stopPropagation();removeHotel(${h.id})">Usuń</button><button class="terms-btn small" onclick="event.stopPropagation();toggleDates(${h.id})">Terminy i ceny (${h.offers.length})</button></div><div class="departures ${expandedHotels.has(h.id)?'show':''}">${h.offers.length?h.offers.map(o=>{let inactive=o.status!=='available';return `<button class="departure-choice ${inactive?'inactive ':''}${selected===h.id&&selectedDate===o.date?'active':''}" onclick="event.stopPropagation();selectHotel(${h.id},'${o.date}')"><span>${inactive?`<s>Wylot ${dateOnly(o.date)} · ${money(o.price)} / os.</s>`:`Wylot ${dateOnly(o.date)} · ${money(o.price)} / os.`}</span>${o.status==='expired'?'<span class="term-status">Termin minął</span>':o.status==='unavailable'?'<span class="term-status">Oferta niedostępna</span>':''}${!inactive&&o.price===cheapest?'<span class="best-badge">Najtaniej</span>':''}</button>`}).join(''):'<span class="meta">Kalendarz terminów będzie dostępny po odczycie ITAKA.</span>'}</div></article>`}).join('')}
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 async function loadAirportOptions(id,departure){let h=hotels.find(x=>x.id===id);if(!h||h.provider==='rainbow'&&!departure)return;try{let url=`hotels/${id}/airports`;if(departure)url+=`?date=${encodeURIComponent(departure)}`;let d=await api(url);h.airport_options=d.airports||[];if(h.airport_code&&h.airport_code!=='DEFAULT'&&!h.airport_options.some(o=>o.code===h.airport_code))h.airport_options.unshift({code:h.airport_code,name:h.airport_name||'Obecne lotnisko'});drawHotels();if(d.warning)status(d.warning,true)}catch(e){status(e.message,true)}}
 async function selectHotel(id,departure){selected=id;selectedDate=departure||hotels.find(h=>h.id===id)?.offers?.[0]?.date||null;drawHotels();await loadHistory();await loadAirportOptions(id,selectedDate)}
@@ -777,7 +722,6 @@ def api_hotels():
     rows=c.execute("SELECT id,name,url,people_count,image_url,last_checked_at,country,airport_code,airport_name,airport_options FROM hotels ORDER BY id").fetchall()
     latest=c.execute("SELECT p.* FROM prices p JOIN (SELECT hotel_id,airport_code,departure_date,MAX(id) id FROM prices WHERE departure_date IS NOT NULL GROUP BY hotel_id,airport_code,departure_date) q ON q.id=p.id ORDER BY p.hotel_id,p.airport_code,p.departure_date").fetchall()
     statuses={ (r['hotel_id'],r['airport_code'],r['departure_date']):r for r in c.execute("SELECT hotel_id,airport_code,departure_date,last_seen_at,missing_checks,status,current_price,previous_price FROM tracked_departures_by_airport") }
-    stay_rows=[dict(r) for r in c.execute("SELECT s.hotel_id,s.airport_code,s.departure_date,s.nights,s.days,s.url,s.status,m.monitor_enabled,m.email_enabled,m.last_count,m.last_checked_at FROM stay_offers s LEFT JOIN room_monitors m ON m.hotel_id=s.hotel_id AND m.airport_code=s.airport_code AND m.departure_date=s.departure_date AND m.nights=s.nights WHERE s.departure_date>=date('now') ORDER BY s.departure_date,s.nights").fetchall()]
     c.close()
     today=datetime.utcnow().date().isoformat(); offers={}
     for o in latest:
@@ -807,53 +751,8 @@ def api_hotels():
         hotel_offers.sort(key=lambda o:(o['status']!='available',o['date'] if o['status']=='available' else o['date']))
         current=next((o for o in hotel_offers if o['status']=='available'),None)
         if current is None and hotel_offers: current=hotel_offers[-1]
-        hotel_stays=[dict(airport_code=s['airport_code'],departure_date=s['departure_date'],nights=s['nights'],days=s['days'],status=s['status'],monitor_enabled=bool(s['monitor_enabled']),email_enabled=bool(s['email_enabled']),last_count=s['last_count'],last_checked_at=s['last_checked_at']) for s in stay_rows if s['hotel_id']==h['id']]
-        result.append(dict(id=h['id'],name=h['name'],url=h['url'],country=h['country'],airport_code=h['airport_code'],airport_name=h['airport_name'],airport_options=airport_options,airport_options_by_date=airport_options_by_date,provider=('rainbow' if is_rainbow_url(h['url']) else 'itaka'),people_count=h['people_count'],image_url=h['image_url'],price=current['price'] if current else None,total_price=current['price']*h['people_count'] if current else None,checked=h['last_checked_at'],departure_date=current['date'] if current else None,offers=hotel_offers,stays=hotel_stays))
+        result.append(dict(id=h['id'],name=h['name'],url=h['url'],country=h['country'],airport_code=h['airport_code'],airport_name=h['airport_name'],airport_options=airport_options,airport_options_by_date=airport_options_by_date,provider=('rainbow' if is_rainbow_url(h['url']) else 'itaka'),people_count=h['people_count'],image_url=h['image_url'],price=current['price'] if current else None,total_price=current['price']*h['people_count'] if current else None,checked=h['last_checked_at'],departure_date=current['date'] if current else None,offers=hotel_offers))
     return jsonify(hotels=result)
-@app.post("/api/hotels/<int:hid>/room-monitor")
-@auth_required
-def api_room_monitor(hid):
-    data=request.get_json(force=True)
-    airport=str(data.get("airport_code","")).strip()
-    departure=str(data.get("departure_date","")).strip()
-    try: nights=int(data.get("nights"))
-    except (TypeError,ValueError): nights=0
-    if not airport or not re.fullmatch(r"20\d{2}-\d{2}-\d{2}",departure) or nights<1:
-        return jsonify(error="Nieprawidłowy termin monitorowania pokoi."),400
-    monitor_enabled=data.get("monitor_enabled") is True
-    email_enabled=data.get("email_enabled") is True
-    c=connect()
-    offer=c.execute("SELECT 1 FROM stay_offers WHERE hotel_id=? AND airport_code=? AND departure_date=? AND nights=?",(hid,airport,departure,nights)).fetchone()
-    if not offer:
-        c.close()
-        return jsonify(error="Nie znaleziono dokładnej oferty dla tego terminu."),404
-    room_monitor.set_settings(c,hid,airport,departure,nights,monitor_enabled,email_enabled)
-    c.commit()
-    c.close()
-    try: save_state_to_github()
-    except Exception as exc:
-        app.logger.exception("Could not persist room-monitor settings")
-        return jsonify(error=f"Ustawienia zapisano lokalnie, ale nie udało się zapisać ich w GitHubie: {exc}"),503
-    return jsonify(ok=True,monitor_enabled=monitor_enabled,email_enabled=email_enabled)
-
-
-@app.get("/api/hotels/<int:hid>/room-monitor/history")
-@auth_required
-def api_room_monitor_history(hid):
-    try: sync_state_from_github()
-    except Exception as exc: app.logger.warning("Could not refresh GitHub state before room history lookup: %s",exc)
-    airport=request.args.get("airport","")
-    departure=request.args.get("date","")
-    try: nights=int(request.args.get("nights","0"))
-    except (TypeError,ValueError): nights=0
-    if not airport or not departure or nights<1:
-        return jsonify(error="Nieprawidłowy termin historii pokoi."),400
-    c=connect()
-    rows=room_monitor.get_history(c,hid,airport,departure,nights)
-    c.close()
-    return jsonify(history=rows)
-
-
 @app.get("/api/hotels/<int:hid>/history")
 @auth_required
 def api_history(hid):
@@ -938,14 +837,11 @@ def refresh_airport_options():
                 except (TypeError,ValueError): fresh=False
                 if fresh and entry.get("airports") and all(item.get("url") for item in entry["airports"]):
                     continue
-                # Each date has its own offer key; do not reuse a sold-out base trip.
-                candidates=sorted(entry.get('airports',[]),key=lambda item:item.get('code')!=hotel['airport_code'])
-                source_url=next((item['url'] for item in candidates if item.get('url')),hotel['url'])
                 try:
-                    found=rainbow_airport_variants(source_url,departure_date)["airports"]
+                    found=rainbow_airport_variants(hotel["url"],departure_date)["airports"]
                     options=[]
                     for candidate in found:
-                        selected=rainbow_airport_variants(source_url,departure_date,candidate["code"])
+                        selected=rainbow_airport_variants(hotel["url"],departure_date,candidate["code"])
                         variant_url=sanitize_rainbow_url(selected["url"])
                         if not is_rainbow_url(variant_url):
                             raise ValueError("Rainbow nie zwróciło poprawnego linku wybranego lotu.")
@@ -954,12 +850,6 @@ def refresh_airport_options():
                         raise ValueError("Nie znaleziono lotnisk dla tego terminu.")
                     by_date[departure_date]=dict(updated_at=now.isoformat(),airports=options)
                     checked+=1
-                except RainbowConfigurationUnavailable as exc:
-                    try:
-                        record_rainbow_unavailable(hotel,exc.url)
-                    except Exception as error:
-                        errors+=1
-                        app.logger.warning("Could not identify unavailable Rainbow airport configuration for hotel %s: %s",hotel['id'],error)
                 except Exception as exc:
                     errors+=1
                     app.logger.warning("Could not refresh Rainbow airports for hotel %s and %s: %s",hotel["id"],departure_date,exc)
@@ -968,8 +858,6 @@ def refresh_airport_options():
             c.execute("UPDATE hotels SET airport_options=? WHERE id=?",(json.dumps(payload,ensure_ascii=False),hotel["id"]))
             c.commit(); c.close()
         elif is_itaka_url(hotel["url"]):
-            if isinstance(cached,dict) and cached.get("version")==2:
-                continue  # Refreshed from actual variants by run_checks, not filter checkboxes.
             updated=cached.get("updated_at","") if isinstance(cached,dict) else ""
             try: fresh=datetime.fromisoformat(updated)>cutoff
             except (TypeError,ValueError): fresh=False
@@ -1074,239 +962,45 @@ def api_remove(hid):
     try: save_state_to_github()
     except Exception as e: app.logger.exception("Could not save hotel deletion to GitHub"); return jsonify(error=f"Nie udało się zapisać zmiany w GitHubie: {e}"),503
     return jsonify(ok=True)
-def record_availability_transition(c, hotel_id, airport_code, departure_date, status, stamp, price=None):
-    """Append a real observed status change before updating the current state."""
-    previous=c.execute("SELECT status,current_price FROM tracked_departures_by_airport WHERE hotel_id=? AND airport_code=? AND departure_date=?",(hotel_id,airport_code,departure_date)).fetchone()
-    if previous and previous['status'] in ('available','unavailable') and previous['status']!=status:
-        c.execute("INSERT OR IGNORE INTO availability_events(hotel_id,airport_code,departure_date,checked_at,from_status,to_status,price,previous_price) VALUES(?,?,?,?,?,?,?,?)",(hotel_id,airport_code,departure_date,stamp,previous['status'],status,price if status=='available' else None,previous['current_price']))
-
-
-def fetch_itaka_html(url):
-    """Retry only failed/incomplete transfers; never parse a partial response."""
-    for attempt in range(3):
-        req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0","Accept-Language":"pl-PL,pl;q=0.9"})
-        try:
-            with urllib.request.urlopen(req,timeout=45) as response:
-                return response.read().decode("utf-8",errors="replace")
-        except (http.client.IncompleteRead,http.client.RemoteDisconnected,urllib.error.URLError,TimeoutError,ConnectionError,socket.timeout) as exc:
-            if isinstance(exc,urllib.error.HTTPError) and exc.code not in (408,429,500,502,503,504):
-                raise
-            if attempt==2:
-                raise
-            app.logger.warning('Retrying ITAKA download (%s/3) after %s',attempt+2,type(exc).__name__)
-            time.sleep(0.5*(attempt+1))
-
-
-def check_itaka_hotel(hotel, max_departure):
-    html=fetch_itaka_html(hotel['url'])
-    parsed=parse_itaka_variants(html,hotel['url'],hotel['people_count'],with_airports=True,with_rejected=True,all_durations=True)
-    variants,available=parsed[:2]
-    rejected=list(parsed[2]) if len(parsed)>2 else []
-    # A date-only result can expose just its cheapest short stay. Search again
-    # with the requested duration instead of excluding that departure entirely.
-    available=list({a['code']:a for a in available+[dict(code=v['code']) for v in rejected]}.values())
-    unconfirmed_lengths=set()
-    def per_airport(option):
-        unknown=set()
-        parts=urlparse(hotel['url'])
-        query=[(k,v) for k,v in parse_qsl(parts.query,keep_blank_values=True) if k!='airports']
-        target=urlunparse(parts._replace(query=urlencode(query+[("airports",option['code'])])))
-        data=fetch_itaka_html(target)
-        parsed=parse_itaka_variants(data,target,hotel['people_count'],with_rejected=True,all_durations=True)
-        if isinstance(parsed,tuple):
-            extra=parsed[0];excluded=parsed[2] if len(parsed)>2 else []
-        else:extra,excluded=parsed,[]
-        extra=list(extra);excluded=list(excluded)
-        for days in (8,14,15):
-            requested_url=duration_search_url(hotel['url'],option['code'],days)
-            try:
-                result=parse_itaka_variants(fetch_itaka_html(requested_url),requested_url,hotel['people_count'],with_rejected=True,all_durations=True)
-            except NoItakaVariants:
-                unknown.add((option['code'],days))
-                app.logger.warning('ITAKA no confirmed variants: hotel %s, airport %s, requested days %s; keeping previous history',hotel['id'],option['code'],days)
-                continue
-            extra.extend(result[0]);excluded.extend(result[2])
-        return [v for v in extra if v['code']==option['code']],[v for v in excluded if v['code']==option['code']],unknown
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        for extra,excluded,unknown in pool.map(per_airport,available):
-            variants.extend(extra);rejected.extend(excluded);unconfirmed_lengths.update(unknown)
-    best={}
-    for v in variants:
-        key=(v['date'],v['code'],v.get('nights'))
-        if key not in best or variant_rank(v,hotel['url'])<variant_rank(best[key],hotel['url']): best[key]=v
-    all_variants=[v for v in best.values() if v['date']<=max_departure]
-    primary={}
-    for v in all_variants:
-        key=v['date'],v['code']
-        if key not in primary or variant_rank(v,hotel['url'])<variant_rank(primary[key],hotel['url']):primary[key]=v
-    variants=list(primary.values())
-    seen={(v['date'],v['code']) for v in variants}
-    rejected={(v['date'],v['code']):v for v in rejected if v['date']<=max_departure and (v['date'],v['code']) not in seen}
-    if not variants and not rejected: raise ValueError("Brak potwierdzonych wariantów ITAKA w monitorowanym okresie.")
-    stamp=datetime.utcnow().replace(microsecond=0).isoformat()
-    by_date={}
-    for v in sorted(all_variants,key=lambda v:variant_rank(v,hotel['url'])):
-        by_date.setdefault(v['date'],dict(updated_at=stamp,airports=[]))['airports'].append(v)
-    c=connect()
-    try:
-        stay_history.record(c,hotel['id'],all_variants,stamp,max_departure,unconfirmed_lengths)
-        cached=_decode_airport_options(c.execute("SELECT airport_options FROM hotels WHERE id=?",(hotel['id'],)).fetchone()[0])
-        if not isinstance(cached,dict): cached={}
-        prior_by_date={}
-        if cached.get('version')!=2:
-            # Retain verified legacy airports, and quarantine only misattributed records.
-            trusted={a['code']:a for a in cached.get('airports',[]) if a.get('code')}
-            old_records=c.execute("SELECT departure_date,airport_code FROM tracked_departures_by_airport WHERE hotel_id=?",(hotel['id'],)).fetchall()
-            for row in old_records:
-                code=row['airport_code']
-                if code in trusted:
-                    prior_by_date.setdefault(row['departure_date'],dict(airports=[]))['airports'].append(trusted[code])
-            untrusted={r['airport_code'] for r in old_records}-set(trusted)-{'LEGACY-ITAKA'}
-            for code in untrusted:
-                c.execute("UPDATE prices SET airport_code='LEGACY-ITAKA' WHERE hotel_id=? AND airport_code=?",(hotel['id'],code))
-                c.execute("INSERT OR IGNORE INTO tracked_departures_by_airport(hotel_id,airport_code,departure_date,last_seen_at,missing_checks,status,current_price,previous_price) SELECT hotel_id,'LEGACY-ITAKA',departure_date,last_seen_at,missing_checks,'unavailable',current_price,previous_price FROM tracked_departures_by_airport WHERE hotel_id=? AND airport_code=?",(hotel['id'],code))
-                c.execute("DELETE FROM tracked_departures_by_airport WHERE hotel_id=? AND airport_code=?",(hotel['id'],code))
-        known_by_date={}
-        for source in [prior_by_date,cached.get('known_by_date',{}),cached.get('by_date',{}),by_date]:
-            for date,entry in source.items():
-                previous=known_by_date.get(date,{}).get('airports',[])
-                options=list({a['code']:a for a in previous+entry.get('airports',[]) if a.get('code')}.values())
-                known_by_date[date]=dict(updated_at=stamp,airports=options)
-        for v in variants:
-            previous=c.execute("SELECT price,per_person FROM prices WHERE hotel_id=? AND airport_code=? AND departure_date=? ORDER BY id DESC LIMIT 1",(hotel['id'],v['code'],v['date'])).fetchone()
-            old=(previous['price'] if previous['per_person'] else previous['price']/hotel['people_count']) if previous else None
-            if old is None or abs(old-v['price'])>=0.01:
-                c.execute("INSERT INTO prices(hotel_id,checked_at,price,departure_date,per_person,airport_code) VALUES(?,?,?,?,1,?)",(hotel['id'],stamp,v['price'],v['date'],v['code']))
-            record_availability_transition(c,hotel['id'],v['code'],v['date'],'available',stamp,v['price'])
-            c.execute("INSERT INTO tracked_departures_by_airport(hotel_id,airport_code,departure_date,last_seen_at,missing_checks,status,current_price,previous_price) VALUES(?,?,?,?,0,'available',?,NULL) ON CONFLICT(hotel_id,airport_code,departure_date) DO UPDATE SET last_seen_at=excluded.last_seen_at,missing_checks=0,status='available',previous_price=tracked_departures_by_airport.current_price,current_price=excluded.current_price",(hotel['id'],v['code'],v['date'],stamp,v['price']))
-        seen={(v['date'],v['code']) for v in variants}
-        for old in c.execute("SELECT departure_date,airport_code,status FROM tracked_departures_by_airport WHERE hotel_id=? AND departure_date>=date('now') AND departure_date<=? AND airport_code!='LEGACY-ITAKA'",(hotel['id'],max_departure)).fetchall():
-            if (old['departure_date'],old['airport_code']) not in seen:
-                if (old['departure_date'],old['airport_code']) in rejected:
-                    c.execute("UPDATE tracked_departures_by_airport SET status='excluded_duration' WHERE hotel_id=? AND departure_date=? AND airport_code=?",(hotel['id'],old['departure_date'],old['airport_code']))
-                    continue
-                if old['status']=='excluded_duration':
-                    continue  # Keep filtered history hidden until an eligible stay is actually seen.
-                record_availability_transition(c,hotel['id'],old['airport_code'],old['departure_date'],'unavailable',stamp)
-                c.execute("UPDATE tracked_departures_by_airport SET missing_checks=missing_checks+1,status='unavailable' WHERE hotel_id=? AND departure_date=? AND airport_code=?",(hotel['id'],old['departure_date'],old['airport_code']))
-        original=airport_code_from_url(hotel['url'])[0]
-        selected=next((v for v in variants if v['code']==original),variants[0] if variants else dict(code=hotel['airport_code'],name=hotel['airport_name']))
-        airports=list({v['code']:dict(code=v['code'],name=v['name']) for v in variants}.values())
-        payload=dict(version=2,updated_at=stamp,stay_policy=dict(min_nights=6),excluded_by_date=[dict(date=v['date'],code=v['code'],nights=v.get('nights'),reason=v.get('exclusion_reason')) for v in rejected.values()],airports=airports,by_date=by_date,known_by_date=known_by_date)
-        extractor=Extractor();extractor.feed(html)
-        c.execute("UPDATE hotels SET airport_code=?,airport_name=?,airport_options=?,country=?,image_url=COALESCE(?,image_url),last_checked_at=? WHERE id=?",(selected['code'],selected['name'],json.dumps(payload,ensure_ascii=False),country_from_url(hotel['url']),extractor.image_url,stamp,hotel['id']))
-        c.commit()
-    finally: c.close()
-
-
-def save_rainbow_prices(h,result,max_departure):
-    if len(result)==7: total,image_url,departure_date,calendar_prices,calendar_observed,airport_code,airport_name=result
-    else: total,image_url,departure_date,calendar_prices,calendar_observed=result; airport_code,airport_name=airport_code_from_url(h['url'])
-    stamp=datetime.utcnow().replace(microsecond=0).isoformat()
-    calendar_prices=[(d,p) for d,p in dict(calendar_prices).items() if datetime.strptime(d,"%Y-%m-%d").date()<=datetime.strptime(max_departure,"%Y-%m-%d").date()]
-    if departure_date and departure_date<=max_departure and total is not None:
-        calendar_prices=[(d,total/h['people_count'] if d==departure_date else value) for d,value in calendar_prices]
-        if not any(d==departure_date for d,_ in calendar_prices): calendar_prices.append((departure_date,total/h['people_count']))
-    elif not calendar_prices and total is None and not calendar_observed:
-        return
-    c=connect()
-    try:
-        before=c.execute("SELECT count(*) FROM prices WHERE hotel_id=?",(h['id'],)).fetchone()[0]
-        if is_rainbow_url(h['url']) and h['airport_code']=="DEFAULT" and airport_code!="DEFAULT":
-            c.execute("UPDATE prices SET airport_code=? WHERE hotel_id=? AND airport_code='DEFAULT'",(airport_code,h['id']))
-            c.execute("INSERT OR IGNORE INTO tracked_departures_by_airport(hotel_id,airport_code,departure_date,last_seen_at,missing_checks,status,current_price,previous_price) SELECT hotel_id,?,departure_date,last_seen_at,missing_checks,status,current_price,previous_price FROM tracked_departures_by_airport WHERE hotel_id=? AND airport_code='DEFAULT'",(airport_code,h['id']))
-            c.execute("DELETE FROM tracked_departures_by_airport WHERE hotel_id=? AND airport_code='DEFAULT'",(h['id'],))
-        if calendar_prices:
-            for date_value,person_price in calendar_prices:
-                previous=c.execute("SELECT price,per_person FROM prices WHERE hotel_id=? AND airport_code=? AND departure_date=? ORDER BY id DESC LIMIT 1",(h['id'],airport_code,date_value)).fetchone()
-                old_price=(previous['price'] if previous['per_person'] else previous['price']/h['people_count']) if previous else None
-                if old_price is None or abs(old_price-person_price)>=0.01:
-                    c.execute("INSERT INTO prices(hotel_id,checked_at,price,departure_date,per_person,airport_code) VALUES(?,?,?,?,1,?)",(h['id'],stamp,person_price,date_value,airport_code))
-        elif total is not None:
-            previous=c.execute("SELECT price FROM prices WHERE hotel_id=? AND airport_code=? AND departure_date IS ? ORDER BY id DESC LIMIT 1",(h['id'],airport_code,departure_date)).fetchone()
-            if previous is None or abs(previous['price']-total)>=0.01:
-                c.execute("INSERT INTO prices(hotel_id,checked_at,price,departure_date,per_person,airport_code) VALUES(?,?,?,?,0,?)",(h['id'],stamp,total,departure_date,airport_code))
-        if calendar_prices:
-            seen_dates={date_value for date_value,_ in calendar_prices}
-            for date_value in seen_dates:
-                record_availability_transition(c,h['id'],airport_code,date_value,'available',stamp,dict(calendar_prices)[date_value])
-                c.execute("INSERT INTO tracked_departures_by_airport(hotel_id,airport_code,departure_date,last_seen_at,missing_checks,status,current_price,previous_price) VALUES(?,?,?, ?,0,'available',?,NULL) ON CONFLICT(hotel_id,airport_code,departure_date) DO UPDATE SET last_seen_at=excluded.last_seen_at,missing_checks=0,status='available',previous_price=tracked_departures_by_airport.current_price,current_price=excluded.current_price",(h['id'],airport_code,date_value,stamp,dict(calendar_prices)[date_value]))
-            known=c.execute("SELECT departure_date FROM tracked_departures_by_airport WHERE hotel_id=? AND airport_code=? AND departure_date>=date('now') AND departure_date<=?",(h['id'],airport_code,max_departure)).fetchall()
-            for record in known:
-                if calendar_observed and record['departure_date'] not in seen_dates:
-                    record_availability_transition(c,h['id'],airport_code,record['departure_date'],'unavailable',stamp)
-                    c.execute("UPDATE tracked_departures_by_airport SET missing_checks=missing_checks+1,status='unavailable' WHERE hotel_id=? AND airport_code=? AND departure_date=?",(h['id'],airport_code,record['departure_date']))
-        c.execute("UPDATE hotels SET image_url=COALESCE(?,image_url),last_checked_at=?,country=?,airport_code=?,airport_name=? WHERE id=?",(image_url,stamp,country_from_url(h['url']),airport_code if h['airport_code']=='DEFAULT' else h['airport_code'],airport_name if h['airport_code']=='DEFAULT' else h['airport_name'],h['id']))
-        after=c.execute("SELECT count(*) FROM prices WHERE hotel_id=?",(h['id'],)).fetchone()[0]
-        c.commit()
-    except Exception:
-        c.rollback()
-        raise
-    finally:
-        c.close()
-    print(f"Rainbow read: hotel {h['id']}, airport {airport_code}, {len(calendar_prices)} dates, {after-before} price changes, complete calendar: {calendar_observed}")
-
-def check_rainbow_hotel(h,max_departure):
-    """Find a live anchor per saved airport, even after the original trip expires."""
-    today=datetime.utcnow().date().isoformat()
-    cache=_decode_airport_options(h['airport_options'])
-    by_date=cache.get('by_date',{}) if isinstance(cache,dict) else {}
-    c=connect()
-    statuses={(r['departure_date'],r['airport_code']):r['status'] for r in c.execute('SELECT departure_date,airport_code,status FROM tracked_departures_by_airport WHERE hotel_id=?',(h['id'],))}
-    c.close()
-    candidates={}
-    mapped_original=False
-    for date,entry in sorted(by_date.items()):
-        for option in entry.get('airports',[]):
-            url=option.get('url');code=option.get('code')
-            if url and sanitize_rainbow_url(url)==sanitize_rainbow_url(h['url']):
-                mapped_original=True
-            if code and url and is_rainbow_url(url) and today<=date<=max_departure:
-                candidates.setdefault(code,[]).append((statuses.get((date,code))=='unavailable',date,sanitize_rainbow_url(url)))
-    if not mapped_original:
-        candidates.setdefault(h['airport_code'],[]).insert(0,(False,today,sanitize_rainbow_url(h['url'])))
-    errors=0
-    for code in sorted(candidates,key=lambda code:code!=h['airport_code']):
-        failures=[];success=False;seen_urls=set()
-        for _,date,url in sorted(candidates[code]):
-            if url in seen_urls:continue
-            seen_urls.add(url)
-            try:
-                result=fetch_offer(url,h['people_count'])
-                actual=result[5] if len(result)==7 else h['airport_code']
-                if code!='DEFAULT' and actual!=code:
-                    raise ValueError(f'Rainbow returned airport {actual}, expected {code}; prices not saved.')
-                save_rainbow_prices(h,result,max_departure)
-                if code==h['airport_code'] or h['airport_code']=='DEFAULT':
-                    c=connect();c.execute('UPDATE hotels SET url=? WHERE id=?',(url,h['id']));c.commit();c.close()
-                success=True
-                break
-            except RainbowConfigurationUnavailable as exc:
-                try:
-                    record_rainbow_unavailable(h,exc.url)
-                    app.logger.warning('Rainbow unavailable configuration: hotel %s, airport %s, date %s; trying next configuration',h['id'],code,date)
-                except Exception as error:
-                    failures.append(error)
-            except Exception as exc:
-                failures.append(exc)
-                app.logger.warning('Rainbow anchor failed: hotel %s, airport %s, date %s: %s',h['id'],code,date,exc)
-        if not success:
-            app.logger.warning('Rainbow no price calendar: hotel %s, airport %s, %s configurations checked',h['id'],code,len(seen_urls))
-            if failures:errors+=1
-    if not candidates:
-        app.logger.warning('Rainbow no future saved configurations: hotel %s',h['id'])
-        errors+=1
-    return errors
-
-
 def run_checks():
-    c=connect(); hs=c.execute("SELECT id,url,people_count,airport_code,airport_name,country,airport_options FROM hotels ORDER BY id").fetchall(); max_departure=c.execute("SELECT date('now','start of month','+3 months','-1 day')").fetchone()[0]; c.close(); errors=0
+    c=connect(); hs=c.execute("SELECT id,url,people_count,airport_code,airport_name,country FROM hotels ORDER BY id").fetchall(); max_departure=c.execute("SELECT date('now','start of month','+3 months','-1 day')").fetchone()[0]; c.close(); errors=0
     for h in hs:
         try:
-            if is_itaka_url(h['url']):
-                check_itaka_hotel(h,max_departure)
-            else:
-                errors+=check_rainbow_hotel(h,max_departure)
+            result=fetch_offer(h['url'],h['people_count']);
+            if len(result)==7: total,image_url,departure_date,calendar_prices,calendar_observed,airport_code,airport_name=result
+            else: total,image_url,departure_date,calendar_prices,calendar_observed=result; airport_code,airport_name=airport_code_from_url(h['url'])
+            stamp=datetime.utcnow().replace(microsecond=0).isoformat()
+            calendar_prices=[(d,p) for d,p in dict(calendar_prices).items() if datetime.strptime(d,"%Y-%m-%d").date()<=datetime.strptime(max_departure,"%Y-%m-%d").date()]
+            if departure_date and departure_date<=max_departure and total is not None:
+                calendar_prices=[(d,total/h['people_count'] if d==departure_date else value) for d,value in calendar_prices]
+                if not any(d==departure_date for d,_ in calendar_prices): calendar_prices.append((departure_date,total/h['people_count']))
+            elif not calendar_prices and total is None and not calendar_observed:
+                continue
+            c=connect()
+            if is_rainbow_url(h['url']) and h['airport_code']=="DEFAULT" and airport_code!="DEFAULT":
+                c.execute("UPDATE prices SET airport_code=? WHERE hotel_id=? AND airport_code='DEFAULT'",(airport_code,h['id']))
+                c.execute("INSERT OR IGNORE INTO tracked_departures_by_airport(hotel_id,airport_code,departure_date,last_seen_at,missing_checks,status,current_price,previous_price) SELECT hotel_id,?,departure_date,last_seen_at,missing_checks,status,current_price,previous_price FROM tracked_departures_by_airport WHERE hotel_id=? AND airport_code='DEFAULT'",(airport_code,h['id']))
+                c.execute("DELETE FROM tracked_departures_by_airport WHERE hotel_id=? AND airport_code='DEFAULT'",(h['id'],))
+            if calendar_prices:
+                for date_value,person_price in calendar_prices:
+                    previous=c.execute("SELECT price,per_person FROM prices WHERE hotel_id=? AND airport_code=? AND departure_date=? ORDER BY id DESC LIMIT 1",(h['id'],airport_code,date_value)).fetchone()
+                    old_price=(previous['price'] if previous['per_person'] else previous['price']/h['people_count']) if previous else None
+                    if old_price is None or abs(old_price-person_price)>=0.01:
+                        c.execute("INSERT INTO prices(hotel_id,checked_at,price,departure_date,per_person,airport_code) VALUES(?,?,?,?,1,?)",(h['id'],stamp,person_price,date_value,airport_code))
+            elif total is not None:
+                previous=c.execute("SELECT price FROM prices WHERE hotel_id=? AND airport_code=? AND departure_date IS ? ORDER BY id DESC LIMIT 1",(h['id'],airport_code,departure_date)).fetchone()
+                if previous is None or abs(previous['price']-total)>=0.01:
+                    c.execute("INSERT INTO prices(hotel_id,checked_at,price,departure_date,per_person,airport_code) VALUES(?,?,?,?,0,?)",(h['id'],stamp,total,departure_date,airport_code))
+            if calendar_observed:
+                seen_dates={date_value for date_value,_ in calendar_prices}
+                for date_value in seen_dates:
+                    c.execute("INSERT INTO tracked_departures_by_airport(hotel_id,airport_code,departure_date,last_seen_at,missing_checks,status,current_price,previous_price) VALUES(?,?,?, ?,0,'available',?,NULL) ON CONFLICT(hotel_id,airport_code,departure_date) DO UPDATE SET last_seen_at=excluded.last_seen_at,missing_checks=0,status='available',previous_price=tracked_departures_by_airport.current_price,current_price=excluded.current_price",(h['id'],airport_code,date_value,stamp,dict(calendar_prices)[date_value]))
+                known=c.execute("SELECT departure_date FROM tracked_departures_by_airport WHERE hotel_id=? AND airport_code=? AND departure_date>=date('now') AND departure_date<=?",(h['id'],airport_code,max_departure)).fetchall()
+                for record in known:
+                    if record['departure_date'] not in seen_dates:
+                        c.execute("UPDATE tracked_departures_by_airport SET missing_checks=missing_checks+1,status=CASE WHEN missing_checks+1>=2 THEN 'unavailable' ELSE status END WHERE hotel_id=? AND airport_code=? AND departure_date=?",(h['id'],airport_code,record['departure_date']))
+            c.execute("UPDATE hotels SET image_url=COALESCE(?,image_url),last_checked_at=?,country=?,airport_code=?,airport_name=? WHERE id=?",(image_url,stamp,country_from_url(h['url']),airport_code,airport_name,h['id']))
+            c.commit(); c.close()
         except Exception as e:
             errors+=1; app.logger.warning("Price check failed for hotel %s: %s",h['id'],e)
     return len(hs),errors
@@ -1329,7 +1023,6 @@ def scheduler():
         time.sleep(INTERVAL_SECONDS)
 
 if AUTO_SCHEDULER: threading.Thread(target=scheduler,daemon=True,name="price-scheduler").start()
-
 
 
 
