@@ -662,7 +662,7 @@ def state_from_database():
            "availability_events":[dict(row) for row in c.execute("SELECT id,hotel_id,airport_code,departure_date,checked_at,from_status,to_status,price,previous_price FROM availability_events ORDER BY id")],
            "updated_at":datetime.utcnow().replace(microsecond=0).isoformat()}
     state.update(stay_history.export_state(c))
-     state.update(room_monitor.export_state(c))
+    state.update(room_monitor.export_state(c))
     c.close()
     return state
 
