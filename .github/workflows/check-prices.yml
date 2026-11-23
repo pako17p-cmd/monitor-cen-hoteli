@@ -1,6 +1,8 @@
 name: Check hotel prices
 
 on:
+  push:
+    branches: [main]
   schedule:
     # Check freshness every 15 minutes; retry overdue/failed checks until successful.
     - cron: "7,22,37,52 * * * *"
