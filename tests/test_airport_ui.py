@@ -46,8 +46,13 @@ class AirportUiTests(unittest.TestCase):
         ]
         self.posts=[]
         self.page=self.browser.new_page()
+        self.page.on("pageerror",lambda exc: print(f"BROWSER PAGE ERROR: {exc}"))
+        self.page.on("console",lambda msg: print(f"BROWSER CONSOLE ERROR: {msg.text}") if msg.type=="error" else None)
         self.page.route("**/*",self.route)
         self.page.goto("http://hotel-test.local/")
+        self.page.wait_for_timeout(500)
+        if self.page.locator("article.hotel").count() < 2:
+            print("AIRPORT UI DEBUG:",self.page.locator("#status").inner_text(),self.page.locator("#hotels").inner_html())
         self.select=self.page.locator("article.hotel").nth(1).locator("select")
         self.select.wait_for(state="visible")
 
