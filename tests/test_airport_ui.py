@@ -21,7 +21,7 @@ def hotel(id,name,date,provider,code):
     return dict(id=id,name=name,url="https://r.pl/example",country="Hiszpania",
         airport_code=code,airport_name="Warszawa Chopin",people_count=2,
         image_url=None,price=3830.5,total_price=7661,checked="2026-10-21T06:00:00",
-        departure_date=date,provider=provider,airport_options=[AIRPORTS[0]],
+        departure_date=date,provider=provider,airport_options=[AIRPORTS[0]],stays=[],
         airport_options_by_date={"2026-10-29":AIRPORTS,"2026-12-31":DECEMBER} if provider=="rainbow" else {},
         offers=[dict(date=date,price=3830.5,status="available")]+
                ([dict(date="2026-12-31",price=7000,status="available")] if provider=="rainbow" else []))
@@ -78,6 +78,13 @@ class AirportUiTests(unittest.TestCase):
         else:
             raise AssertionError(f"Unexpected API route: {path}")
         route.fulfill(content_type="application/json",body=json.dumps(result))
+
+    def test_itaka_room_monitor_is_visible_without_saved_stays(self):
+        row=self.page.locator(".room-monitor-row")
+        row.wait_for(state="visible")
+        self.assertIn("Wylot 24.10.2026",row.inner_text())
+        self.assertIn("Monitoruj pokoje",row.inner_text())
+        self.assertTrue(row.locator('input[type="checkbox"]').first.is_visible())
 
     def test_airport_choices_survive_periodic_hotel_refresh(self):
         self.assertEqual(self.select.locator("option").count(),4)
