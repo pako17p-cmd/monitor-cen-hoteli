@@ -73,7 +73,7 @@ def parse_room_count(source):
     text=re.sub(r"\s+"," ",text)
     # If the page mentions more than one numeric room quantity, the result is ambiguous.
     # Do not accept a matching "left" phrase while ignoring another room count elsewhere.
-    mentions=re.findall(r"\\b(\\d{1,3})\\s+(?:pokój|pokoje|pokoi|rooms?)\\b",text,re.I)
+    mentions=re.findall(r"\b(\d{1,3})\s+(?:pokój|pokoje|pokoi|rooms?)\b",text,re.I)
     if len(mentions)>1:
         return None
     counts=set()
