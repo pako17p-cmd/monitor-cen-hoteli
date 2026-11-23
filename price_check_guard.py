@@ -23,13 +23,15 @@ def should_check(state, now, manual=False, schedule=None):
     if manual:
         return True
 
-    # The dedicated 15-minute trigger must only retry a collection that
-    # started but has not been confirmed successful.
+    # Retry trigger runs only when a previous attempt has not been confirmed.
     if schedule == RETRY_CRON:
+        attempted_value = state.get('attempted_at')
+        if not attempted_value:
+            return False
         try:
-            success = parse_time(state['successful_at'])
-            attempted = parse_time(state.get('attempted_at', state['successful_at']))
-            return attempted > success
+            attempted = parse_time(attempted_value)
+            success_value = state.get('successful_at')
+            return not success_value or attempted > parse_time(success_value)
         except (KeyError, ValueError, TypeError, AttributeError):
             return False
 
