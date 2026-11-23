@@ -46,10 +46,16 @@ class AirportUiTests(unittest.TestCase):
         ]
         self.posts=[]
         self.page=self.browser.new_page()
+        self.page.on("pageerror",lambda error: print("BROWSER PAGE ERROR:",error))
         self.page.route("**/*",self.route)
         self.page.goto("http://hotel-test.local/")
         self.select=self.page.locator("article.hotel").nth(1).locator("select")
-        self.select.wait_for(state="visible")
+        try:
+            self.select.wait_for(state="visible",timeout=5000)
+        except Exception:
+            print("DEBUG HOTELS TEXT:",self.page.locator("#hotels").inner_text())
+            print("DEBUG HOTEL COUNT:",self.page.locator("article.hotel").count())
+            raise
 
     def tearDown(self):
         self.page.close()
