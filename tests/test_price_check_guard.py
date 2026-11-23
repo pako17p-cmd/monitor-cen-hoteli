@@ -41,6 +41,9 @@ class PriceCheckGuardTests(unittest.TestCase):
         self.assertFalse(guard.should_check(fresh, self.now, schedule=guard.RETRY_CRON))
         self.assertTrue(guard.should_check(failed, self.now, schedule=guard.RETRY_CRON))
         self.assertFalse(guard.should_check({}, self.now, schedule=guard.RETRY_CRON))
+        # A failed first-ever run has an attempt timestamp but no success timestamp.
+        first_failed = {'attempted_at': (self.now-timedelta(minutes=5)).isoformat()}
+        self.assertTrue(guard.should_check(first_failed, self.now, schedule=guard.RETRY_CRON))
 
     def test_marker_update_keeps_other_fields_and_retries_conflict(self):
         with patch.object(guard, 'read_marker', return_value=({'attempted_at': self.recent}, 'abc')), patch.object(guard.github_state, '_request', side_effect=[(409, None), (200, None)]) as req:
