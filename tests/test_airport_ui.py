@@ -22,7 +22,7 @@ def hotel(id,name,date,provider,code):
         airport_code=code,airport_name="Warszawa Chopin",people_count=2,
         image_url=None,price=3830.5,total_price=7661,checked="2026-10-21T06:00:00",
         departure_date=date,provider=provider,airport_options=[AIRPORTS[0]],stays=[],
-        airport_options_by_date={"2026-10-29":AIRPORTS,"2026-12-31":DECEMBER} if provider=="rainbow" else {},
+        airport_options_by_date={"2026-12-11":AIRPORTS,"2026-12-31":DECEMBER} if provider=="rainbow" else {},
         offers=[dict(date=date,price=3830.5,status="available")]+
                ([dict(date="2026-12-31",price=7000,status="available")] if provider=="rainbow" else []))
 
@@ -41,8 +41,8 @@ class AirportUiTests(unittest.TestCase):
 
     def setUp(self):
         self.hotels=[
-            hotel(1,"Other hotel","2026-10-24","itaka","WAW"),
-            hotel(5,"Palia Don Pedro","2026-10-29","rainbow","R-WARSZAWA-CHOPIN"),
+            hotel(1,"Other hotel","2026-12-04","itaka","WAW"),
+            hotel(5,"Palia Don Pedro","2026-12-11","rainbow","R-WARSZAWA-CHOPIN"),
         ]
         self.posts=[]
         self.page=self.browser.new_page()
@@ -82,7 +82,7 @@ class AirportUiTests(unittest.TestCase):
     def test_itaka_room_monitor_is_visible_without_saved_stays(self):
         row=self.page.locator(".room-monitor-row")
         row.wait_for(state="visible")
-        self.assertIn("Wylot 24.10.2026",row.inner_text())
+        self.assertIn("Wylot 04.12.2026",row.inner_text())
         self.assertIn("Monitoruj pokoje",row.inner_text())
         self.assertTrue(row.locator('input[type="checkbox"]').first.is_visible())
 
@@ -93,12 +93,12 @@ class AirportUiTests(unittest.TestCase):
             ["Zmień lotnisko…","Warszawa Chopin","Poznań","Katowice"])
 
     def test_airport_selection_uses_displayed_date_not_another_hotel(self):
-        self.assertEqual(self.page.evaluate("selectedDate"),"2026-10-24")
+        self.assertEqual(self.page.evaluate("selectedDate"),"2026-12-04")
         self.select.select_option("R-POZNAN")
         self.page.wait_for_function("document.querySelector('#chartname').textContent.includes('Palia Don Pedro')")
-        self.assertEqual(self.posts,[{"airport_code":"R-POZNAN","date":"2026-10-29"}])
+        self.assertEqual(self.posts,[{"airport_code":"R-POZNAN","date":"2026-12-11"}])
         self.assertEqual(self.page.evaluate("selected"),5)
-        self.assertEqual(self.page.evaluate("selectedDate"),"2026-10-29")
+        self.assertEqual(self.page.evaluate("selectedDate"),"2026-12-11")
         self.assertEqual(self.select.input_value(),"R-POZNAN")
 
     def test_each_displayed_date_keeps_its_own_airports_after_refresh(self):
@@ -106,7 +106,7 @@ class AirportUiTests(unittest.TestCase):
         self.page.evaluate("load()")
         self.assertEqual(self.select.locator("option").count(),5)
         self.assertIn("Wrocław",self.select.locator("option").all_text_contents())
-        self.page.evaluate("selectHotel(5,'2026-10-29')")
+        self.page.evaluate("selectHotel(5,'2026-12-11')")
         self.assertNotIn("Wrocław",self.select.locator("option").all_text_contents())
 
 class AirportApiTests(unittest.TestCase):
@@ -116,7 +116,7 @@ class AirportApiTests(unittest.TestCase):
                  patch.object(hotel_app,"sync_state_from_github",return_value=True), \
                  patch.object(hotel_app,"APP_PASSWORD",""):
                 db=hotel_app.connect()
-                cached={"by_date":{"2026-10-29":{"airports":[dict(item,url="https://r.pl/private-variant") for item in AIRPORTS]}}}
+                cached={"by_date":{"2026-12-11":{"airports":[dict(item,url="https://r.pl/private-variant") for item in AIRPORTS]}}}
                 db.execute("UPDATE hotels SET airport_options=? WHERE id=1",(json.dumps(cached),))
                 db.execute("UPDATE hotels SET airport_options=? WHERE id=2",(json.dumps({"airports":[{"code":"WAW","name":"Warszawa"},{"code":"POZ","name":"Poznań"}]}),))
                 db.commit()
@@ -124,9 +124,9 @@ class AirportApiTests(unittest.TestCase):
                 response=hotel_app.app.test_client().get("/api/hotels")
                 self.assertEqual(response.status_code,200)
                 hotels={item["id"]:item for item in response.get_json()["hotels"]}
-                self.assertEqual(hotels[1]["airport_options_by_date"]["2026-10-29"],AIRPORTS)
+                self.assertEqual(hotels[1]["airport_options_by_date"]["2026-12-11"],AIRPORTS)
                 self.assertEqual(len(hotels[2]["airport_options"]),2)
-                self.assertNotIn("url",hotels[1]["airport_options_by_date"]["2026-10-29"][0])
+                self.assertNotIn("url",hotels[1]["airport_options_by_date"]["2026-12-11"][0])
 
 if __name__=="__main__":
     unittest.main()
