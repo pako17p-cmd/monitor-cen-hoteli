@@ -59,6 +59,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           HISTORY_BRANCH: price-history
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          ROOM_ALERT_EMAIL: ${{ secrets.ROOM_ALERT_EMAIL }}
         run: python check_prices.py
 
       - name: Confirm successful history update
