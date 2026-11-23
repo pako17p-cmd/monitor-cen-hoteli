@@ -71,6 +71,11 @@ def parse_room_count(source):
     text=re.sub(r"\\u([0-9a-fA-F]{4})",lambda m:chr(int(m.group(1),16)),text)
     text=re.sub(r"<[^>]*>"," ",text)
     text=re.sub(r"\s+"," ",text)
+    # If the page mentions more than one numeric room quantity, the result is ambiguous.
+    # Do not accept a matching "left" phrase while ignoring another room count elsewhere.
+    mentions=re.findall(r"\\b(\\d{1,3})\\s+(?:pokój|pokoje|pokoi|rooms?)\\b",text,re.I)
+    if len(mentions)>1:
+        return None
     counts=set()
     for pattern in _ROOM_PATTERNS:
         counts.update(int(m.group(1)) for m in pattern.finditer(text))
