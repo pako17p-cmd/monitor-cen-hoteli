@@ -23,17 +23,23 @@ def should_check(state, now, manual=False, schedule=None):
     if manual:
         return True
 
-    # Retry trigger runs only when a previous attempt has not been confirmed.
+    # The 15-minute trigger is both a retry and a watchdog: it recovers
+    # failed attempts AND a missed two-hour collection schedule.
     if schedule == RETRY_CRON:
-        attempted_value = state.get('attempted_at')
-        if not attempted_value:
-            return False
         try:
-            attempted = parse_time(attempted_value)
             success_value = state.get('successful_at')
-            return not success_value or attempted > parse_time(success_value)
+            attempted_value = state.get('attempted_at')
+            if not success_value:
+                # No confirmed collection yet: do not wait indefinitely for
+                # the separate regular cron to fire.
+                return True
+            success = parse_time(success_value)
+            if attempted_value and parse_time(attempted_value) > success:
+                return True
+            return now - success >= timedelta(hours=2)
         except (KeyError, ValueError, TypeError, AttributeError):
-            return False
+            # Unreadable status must fail open to a price check, not skip it.
+            return True
 
     # The regular cron is the independent, authoritative two-hour trigger.
     if schedule == REGULAR_CRON:
