@@ -49,20 +49,12 @@ jobs:
         if: steps.freshness.outputs.run == 'true'
         run: python -m playwright install chromium --only-shell
 
-      - name: Run regression tests (browser UI tests temporarily disabled)
+      - name: Run regression tests
         if: steps.freshness.outputs.run == 'true'
         env:
           DISABLE_SCHEDULER: "1"
           DB_PATH: ${{ runner.temp }}/hotel-regression.db
-        run: |
-          for test_file in tests/test_*.py; do
-            if [ "$test_file" = "tests/test_airport_ui.py" ]; then
-              echo "Skipping browser UI tests temporarily: $test_file"
-              continue
-            fi
-            echo "Running $test_file"
-            python -m unittest discover -s tests -p "$(basename "$test_file")" -v || exit 1
-          done
+        run: python -m unittest discover -s tests -p "test_*.py" -v
 
       - name: Read prices and save history
         if: steps.freshness.outputs.run == 'true'
