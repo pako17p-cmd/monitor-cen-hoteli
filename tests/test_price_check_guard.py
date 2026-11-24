@@ -35,15 +35,22 @@ class PriceCheckGuardTests(unittest.TestCase):
         state = {'successful_at': self.recent}
         self.assertTrue(guard.should_check(state, self.now, schedule=guard.REGULAR_CRON))
 
-    def test_retry_cron_only_starts_when_attempt_is_pending(self):
+    def test_retry_cron_skips_fresh_success_but_recovers_failed_attempt(self):
         fresh = {'successful_at': self.recent}
         failed = {'successful_at': self.recent, 'attempted_at': (self.now-timedelta(minutes=5)).isoformat()}
         self.assertFalse(guard.should_check(fresh, self.now, schedule=guard.RETRY_CRON))
         self.assertTrue(guard.should_check(failed, self.now, schedule=guard.RETRY_CRON))
-        self.assertFalse(guard.should_check({}, self.now, schedule=guard.RETRY_CRON))
+
+    def test_retry_cron_recovers_missed_regular_schedule(self):
+        stale = {'successful_at': (self.now-timedelta(hours=2)).isoformat()}
+        self.assertTrue(guard.should_check(stale, self.now, schedule=guard.RETRY_CRON))
+        self.assertTrue(guard.should_check({}, self.now, schedule=guard.RETRY_CRON))
         # A failed first-ever run has an attempt timestamp but no success timestamp.
         first_failed = {'attempted_at': (self.now-timedelta(minutes=5)).isoformat()}
         self.assertTrue(guard.should_check(first_failed, self.now, schedule=guard.RETRY_CRON))
+
+    def test_retry_cron_fails_open_on_invalid_status(self):
+        self.assertTrue(guard.should_check({'successful_at': 'invalid'}, self.now, schedule=guard.RETRY_CRON))
 
     def test_marker_update_keeps_other_fields_and_retries_conflict(self):
         with patch.object(guard, 'read_marker', return_value=({'attempted_at': self.recent}, 'abc')), patch.object(guard.github_state, '_request', side_effect=[(409, None), (200, None)]) as req:
